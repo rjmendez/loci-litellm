@@ -1,0 +1,96 @@
+# Reference config for a LiteLLM proxy running the Loci integration.
+# Copy, replace the <placeholders> with your providers, and validate with:
+#     python deploy/check_deployment.py --config config.yaml --env .env
+# The same check runs against this file in tests/test_deploy_check.py.
+#
+# Rules this file demonstrates (see check_deployment.py for the enforced list):
+#   * upstreams are DNS names, never IP addresses
+#   * every billed deployment carries input/output cost
+#   * the embedding group is pinned: no tier, no fallback
+
+model_list:
+  # --- groups. `order`: lower is tried first. Here the hosted deployment is preferred and the local one is
+  #     the last resort; reverse the numbers to prefer local. `tags` feed router tag filtering. ----------
+  - model_name: simple-tier
+    litellm_params:
+      model: openai/<local-model>                # any LiteLLM provider prefix works here
+      api_base: os.environ/LOCAL_LLM_API_BASE    # your local inference server
+      order: 4
+      tags: ["local"]
+      timeout: 60
+    model_info: {id: local-simple, max_tokens: 8192}
+  - model_name: simple-tier
+    litellm_params:
+      model: openai/<provider>/<small-model>
+      api_base: https://<provider-host>/v1
+      api_key: os.environ/PROVIDER_API_KEY
+      order: 2
+    model_info:
+      id: cloud-simple
+      max_tokens: 8192
+      input_cost_per_token: 0.00000006           # list price, dollars per token
+      output_cost_per_token: 0.0000004
+
+  - model_name: medium-tier
+    litellm_params:
+      model: openai/<provider>/<medium-model>
+      api_base: https://<provider-host>/v1
+      api_key: os.environ/PROVIDER_API_KEY
+      order: 3
+    model_info:
+      id: cloud-medium
+      max_tokens: 65536
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+
+  # --- explicit-only model: reachable by name, in no tier and no fallback -------------
+  - model_name: <provider>/<pinned-model>
+    litellm_params:
+      model: openai/<provider>/<pinned-model>
+      api_base: https://<provider-host>/v1
+      api_key: os.environ/PROVIDER_API_KEY
+    model_info:
+      id: cloud-pinned
+      input_cost_per_token: 0.0000014
+      output_cost_per_token: 0.0000044
+
+  # --- pinned embedder: never a tier, never a fallback --------------------------------
+  - model_name: embedding
+    litellm_params:
+      model: openai/<embedding-model>
+      api_base: os.environ/LOCAL_EMBED_API_BASE
+    model_info: {id: embed-default}
+
+  - model_name: auto-router
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers: {SIMPLE: simple-tier, MEDIUM: medium-tier, COMPLEX: medium-tier, REASONING: medium-tier}
+        classifier_type: heuristic
+        complexity_router_default_model: medium-tier
+
+router_settings:
+  routing_strategy: simple-shuffle
+  enable_tag_filtering: true      # needed by the capability gate
+  num_retries: 2
+  allowed_fails: 0
+  cooldown_time: 60
+  fallbacks:
+    - simple-tier: ["medium-tier"]
+  # Clients that name the embedder directly reach the pinned group.
+  model_group_alias:
+    <embedding-model>: embedding
+
+litellm_settings:
+  drop_params: true
+  callbacks:
+    - loci_litellm.grounding_hook.loci_grounding_hook
+    - loci_litellm.memory_writer.loci_memory_writer
+    - loci_litellm.circuit_monitor.loci_circuit_monitor
+    - loci_litellm.cost_ledger.loci_cost_ledger
+    - loci_litellm.capability_gate.loci_capability_gate   # inert until LOCI_GATE_*_EXCLUDE_TAGS is set
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  store_prompts_in_spend_logs: false
+  trusted_proxy_ranges: ["127.0.0.1/32", "::1/128"]   # loopback only: no reverse proxy in front
