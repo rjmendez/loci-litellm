@@ -146,6 +146,8 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_ROUTER_ROWS_MAX_BYTES` | `20000000` | At this size the rows file is renamed to `<file>.1`. `0` disables rotation. Per call. |
 | `LOCI_ROUTER_EPSILON` | `0.05` | Exploration rate of the shadow decision; clamped to `0.05`. Per call. |
 | `LOCI_ROUTER_DAILY_CAP_USD` | `50` | Daily cap used for the per-provider 45% share constraint (decimal dollars). |
+| `LOCI_ROUTER_CANARY_SHARE` | `0` | Share of sessions the learned rule may route: `0.1`, `0.5` or `0.9`. `0` (default) or any other value: the learned path is inert. Needs `LOCI_ROUTER_SHADOW=1` and a valid `LOCI_ROUTER_SNAPSHOT`. |
+| `LOCI_ROUTER_SNAPSHOT` | unset | Path of the frozen incumbent snapshot (JSON with `caps`, `mapping`, `sha256`). A snapshot whose caps differ from the pinned envelope, or whose digest does not match, is rejected and the canary stays off. |
 | `LOCI_ROUTER_PAUSE_FILE` | unset | If this path exists, exploration is 0. |
 | `LOCI_ROUTER_EXCLUDE_PROVIDERS` | empty | Comma-separated extra LiteLLM provider prefixes that are never routing arms (seat-billed providers are always excluded). |
 | `LOCI_LOCAL_HOSTS` | empty | Comma-separated hostnames counted as `local` in the ledger. Without it only loopback, private, link-local and `100.64.0.0/10` addresses and `localhost` are local; any other hostname counts as cloud. Per call. |
@@ -265,7 +267,8 @@ Enforcement also covers:
 ## Colony router (shadow)
 
 `loci_litellm.colony_router.loci_colony_router` is a shadow-only router. With `LOCI_ROUTER_SHADOW=1` it records which
-deployment it WOULD choose for each request and never changes the model, the messages or the metadata.
+deployment it WOULD choose for each request and does not change the model, the messages or the metadata unless the
+canary below is switched on.
 
 - Arms are the deployments in the proxy's model list; price and tool support come from `model_info`. Entries with
   `model_info.loci_router_arm: false` or `seat_billed: true`, non-chat models, and seat-billed providers are not arms.
@@ -282,7 +285,15 @@ deployment it WOULD choose for each request and never changes the model, the mes
 
 Session id, task class and tier come from `metadata.session_id` / `task_class` / `tier` or the `x-loci-session`,
 `x-loci-task-class`, `x-loci-tier` headers; a delegated read-write run is flagged by `metadata.delegated_write` or
-`x-loci-delegation: rw`. `ColonyRouter.stats()` counts every degraded condition (no arms, no safe arm, no session, no
+`x-loci-delegation: rw`. Canary (off by default): with `LOCI_ROUTER_CANARY_SHARE` at `0.1`, `0.5` or `0.9`, a valid snapshot and
+`LOCI_ROUTER_SHADOW=1`, the learned rule routes that share of sessions, next to the 10% control slice that stays on the
+incumbent. Requests with tools and delegated writes are never routed by it; exploration is 0.03; a pause file, governor
+level 2 or a missing spend view stops it. A watchdog that judges the learned slice degenerate against the incumbent slice
+rolls the router back, and the rollback marker in `LOCI_ROUTER_LEARN_DIR` keeps it rolled back across restarts. A quality
+breaker (Wilson lower bound, n >= 30 per side) disables cost downgrades for a cell for 24 hours and writes an audit entry
+to `audit.jsonl`.
+
+`ColonyRouter.stats()` counts every degraded condition (no arms, no safe arm, no session, no
 spend view, dropped rows, write errors).
 
 ## License
