@@ -151,7 +151,9 @@ def test_row_fields_are_an_exact_allowlist() -> None:
     assert set(row) == {
         "ts", "call_id", "trace_id", "group", "deployment", "model", "host", "local", "ok", "call_type",
         "stream", "prompt_tokens", "completion_tokens", "cache_read_tokens", "cache_write_tokens", "empty_response",
-        "cost_usd", "latency_s", "cache_hit", "error_class", "internal", "grounding", "agent", "key_alias"}
+        "cost_usd", "latency_s", "cache_hit", "error_class", "internal", "grounding", "agent", "key_alias",
+        "session_id", "has_tools", "task_class", "prefix_hash", "max_tokens", "client_id", "config_hash",
+        "cache_regime", "finish_reason"}
 
 
 def test_unknown_latency_is_null_not_zero() -> None:

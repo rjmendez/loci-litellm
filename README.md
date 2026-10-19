@@ -131,6 +131,8 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_COST_LEDGER_FILE` | `[cost] ledger_file`, else `~/.loci/litellm_cost_ledger.jsonl` | Ledger path. Rows hold `agent` and `key_alias`; treat as sensitive. Per call. |
 | `LOCI_COST_LEDGER_MAX_BYTES` | `50000000` | At this size the ledger is renamed to `<file>.1` (replacing an older one) and a new one starts. `0` disables rotation. Per call. |
 | `LOCI_COST_LEDGER_DISABLED` | unset | `1` stops the ledger once registered. Per call. |
+| `LOCI_CONFIG_HASH` | unset | Label written to the ledger as `config_hash` (first 12 characters). Unset: a hash of the file named by `CONFIG_FILE_PATH`, re-read when its size or mtime changes; empty if neither is usable. Per call. |
+| `LOCI_CACHE_REGIME` | unset | Free-form label (24 characters) written to every ledger row as `cache_regime`, so a change of caching setup can be told apart in later analysis. Per call. |
 | `LOCI_CAPABILITY_GATE_DISABLED` | unset | `1` (or `true`/`yes`/`on`) stops the gate from tagging requests. Per call. |
 | `LOCI_GATE_TOOLS_EXCLUDE_TAGS` | empty | Comma-separated deployment tags to exclude (`!<tag>`) for requests with tool definitions or tool turns. Empty: tools are not gated. Per call. |
 | `LOCI_GATE_IMAGES_EXCLUDE_TAGS` | empty | Same for requests with image content parts. Per call. |
