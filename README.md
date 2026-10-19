@@ -230,6 +230,25 @@ absolute stop. The spend path fails closed (503 `budget_gate_error`); only optim
 `stopped` (health and ZERO-tier calls pass); `PAUSE` only switches off learning and exploration. Remove the callback or set
 `LOCI_GOVERNOR=observe` to roll back.
 
+Enforcement also covers:
+
+- **Per-client caps.** A caller names itself with `x-loci-client` and proves it with `x-loci-client-secret`; the envelope
+  stores only the sha256 of each secret (`[clients.<name>] secret_sha256`, `cap_day`, `interactive`, `rw`). A wrong or
+  missing secret is attributed to the `anonymous` bucket (its own cap, `anonymous_day`) and flagged `client_unknown`.
+  There is no LiteLLM database and no virtual key: in the proxy tree this was written against, a non-master key with no
+  database answers `No connected db.` (`user_api_key_auth.py`), so per-client caps live in the Governor.
+- **Prompt budget.** A cloud request over `prompt_tokens_max` (default 60,000) without a large-context lease has its
+  injected retrieved context trimmed first, then is downgraded to the cheapest adequate arm, then is refused (413,
+  `prompt_budget`). A lease is a token in `x-loci-lease` accepted by the `lease_validator` given to `Governor`; with none
+  configured no lease is ever valid. Local arms are exempt.
+- **High-cost share.** Arms are ranked by `model_info` price (never by name). A request for the top-ranked alias moves one
+  rank down when that rank's spend today passes `high_cost_share` of the daily hard cap or it has had
+  `high_cost_calls_per_hour` calls this hour; with no adequate lower arm the request stays put and is flagged.
+- **Concurrency.** Semaphores: 12 global, 8 per cloud alias, 2 per local device (`loci_card` in `model_info`, else the
+  api_base host). A call waits up to 30 s, then answers 503 `concurrency` with `Retry-After`; the slot is released when
+  the call succeeds, fails, is cancelled or errors in the Governor, and a slot nobody released is reclaimed after 30 min.
+  In observe mode a full limiter is only recorded.
+
 ## License
 
 MIT. See `LICENSE`.

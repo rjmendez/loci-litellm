@@ -31,6 +31,7 @@ visible in stats(). Observe mode records all of this as would-block events and l
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -43,11 +44,13 @@ from datetime import datetime, tzinfo
 from decimal import ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from litellm.integrations.custom_logger import CustomLogger
 from loci_litellm.audit_chain import AuditChain, AuditUnavailable
 from loci_litellm.capability_gate import needs_tools
+from loci_litellm.client_keys import LEASE_HEADER, identify
 from loci_litellm.envelope import Caps, EnvelopeState, EnvelopeWatcher
 
 logger = logging.getLogger("loci_litellm.governor")
@@ -177,6 +180,7 @@ class Arm:
     supports_tools: bool = False
     max_input_tokens: Optional[int] = None
     local: bool = False
+    card: str = ""                            # the device a local arm runs on (concurrency is limited per card)
 
     @property
     def price_in(self) -> Decimal:
@@ -244,11 +248,25 @@ class Catalog:
                 out_per_mtok=_per_mtok(info.get("output_cost_per_token", params.get("output_cost_per_token"))),
                 supports_tools=info.get("supports_function_calling") is True,
                 max_input_tokens=ctx if isinstance(ctx, int) and not isinstance(ctx, bool) else None,
-                local=bool(local)))
+                local=bool(local), card=str(info.get("loci_card") or urlparse(str(params.get("api_base") or "")).netloc or name)))
         return cls(arms, fallbacks, num_retries, p95_completion)
 
     def groups(self) -> dict[str, list[Arm]]:
         return self._groups
+
+    def price_ranks(self) -> dict[str, int]:
+        """Dense price rank per alias, 0 = cheapest, from model_info prices only (a name never matters). An alias is
+        scored by its dearest deployment, so a group is never ranked below what it can route to."""
+        scores = {name: max(a.price_in + a.price_out for a in arms) for name, arms in self._groups.items()}
+        ordered = sorted(set(scores.values()))
+        return {name: ordered.index(score) for name, score in scores.items()}
+
+    def is_high_cost(self, model_name: str) -> bool:
+        """The alias sits in the top price rank, there is more than one rank, and it is not free."""
+        ranks = self.price_ranks()
+        if model_name not in ranks or len(set(ranks.values())) < 2:
+            return False
+        return ranks[model_name] == max(ranks.values()) and any(a.price_in + a.price_out > 0 for a in self._groups[model_name])
 
     def chain(self, model_name: str) -> list[Arm]:
         """Every deployment reachable from the alias: its own, then each fallback alias, transitively."""
@@ -293,6 +311,8 @@ class Request:
     interactive: bool = False
     rw: bool = False
     client_cap: Optional[Decimal] = None
+    lease_ok: bool = False            # a valid large-context lease was presented
+    trimmable_tokens: int = 0         # prompt tokens a grounding trim would remove
 
 
 @dataclass(frozen=True)
@@ -318,6 +338,9 @@ class Decision:
     target_arm: str = ""
     notes: tuple[str, ...] = ()
     explore_allowed: bool = True
+    actions: tuple[str, ...] = ()      # request edits to apply when enforcing, e.g. "trim_grounding"
+    trim_tokens: int = 0
+    high_cost: bool = False            # the target alias is in the top price rank
 
     @property
     def would_block(self) -> bool:
@@ -351,8 +374,8 @@ def cheapest_adequate(catalog: Catalog, req: Request, caps: Caps, *, exclude: Se
     return best
 
 
-def decide(req: Request, snap: Snapshot, caps: Caps, catalog: Catalog) -> Decision:
-    """The pure spend decision. No clock, no files, no environment: everything it needs is an argument."""
+def _decide_spend(req: Request, snap: Snapshot, caps: Caps, catalog: Catalog) -> Decision:
+    """G1/G2: the spend lines. No clock, no files, no environment: everything it needs is an argument."""
     completion = sanitize_max_tokens(req.max_tokens, caps.max_completion_ceiling)
     chain = catalog.chain(req.model)
     reservation = catalog.reservation(chain, req.prompt_tokens, completion)
@@ -414,6 +437,67 @@ def decide(req: Request, snap: Snapshot, caps: Caps, catalog: Catalog) -> Decisi
     return allow()
 
 
+def _is_cloud(chain: Sequence[Arm]) -> bool:
+    return not chain or any(not a.local for a in chain)
+
+
+def _high_cost_step(req: Request, spend: Decision, snap: Snapshot, caps: Caps, catalog: Catalog) -> Decision:
+    """G4: a request that lands on the top-price-rank alias moves one rank down when that alias's share of the day
+    or its calls this hour are over the line. The next adequate rank down is used, down to the cheapest; when there
+    is none the request stays where it is, flagged, never dropped."""
+    target = spend.target_model
+    if spend.action == "reject" or not catalog.is_high_cost(target):
+        return spend
+    over_share = snap.hc_day + spend.reservation > caps.high_cost_share * caps.day_hard
+    over_rate = snap.hc_calls_hour >= caps.high_cost_calls_per_hour
+    if not (over_share or over_rate):
+        return replace(spend, high_cost=True)
+    code = "high_cost_share" if over_share else "high_cost_rate"
+    ranks = catalog.price_ranks()
+    completion = sanitize_max_tokens(req.max_tokens, caps.max_completion_ceiling)
+    lower = [n for n, arms in catalog.groups().items()
+             if ranks[n] < ranks[target] and _group_adequate(arms, req, req.prompt_tokens)]
+    if not lower:
+        return replace(spend, high_cost=True, notes=spend.notes + ("high_cost_no_alternative",))
+    name = max(lower, key=lambda n: ranks[n])
+    arm = min(catalog.groups()[name], key=lambda a: a.price_in + a.price_out)
+    cost = catalog.reservation(catalog.chain(name), req.prompt_tokens, completion)
+    return replace(spend, action="downgrade", code=spend.code or code, reservation=cost, target_model=name,
+                   target_arm=arm.arm_id, explore_allowed=False, high_cost=catalog.is_high_cost(name))
+
+
+def decide(req: Request, snap: Snapshot, caps: Caps, catalog: Catalog) -> Decision:
+    """The pure decision: prompt budget (G3), then the spend lines (G1/G2), then the high-cost share (G4)."""
+    actions: list[str] = []
+    trim = 0
+    prompt = req.prompt_tokens
+    model = req.model
+    g3_code = ""
+    if not req.lease_ok and _is_cloud(catalog.chain(model)) and prompt > caps.prompt_tokens_max:
+        if req.trimmable_tokens > 0:
+            trim = min(req.trimmable_tokens, prompt)
+            prompt -= trim
+            actions.append("trim_grounding")
+        if prompt > caps.prompt_tokens_max:
+            completion = sanitize_max_tokens(req.max_tokens, caps.max_completion_ceiling)
+            current = catalog.reservation(catalog.chain(model), prompt, completion)
+            cand = cheapest_adequate(catalog, replace(req, prompt_tokens=prompt), caps)
+            if cand is not None and cand.model_name != model and cand.reservation < current:
+                model, g3_code = cand.model_name, "prompt_budget"
+                actions.append("downgrade_prompt_budget")
+            else:
+                return Decision("reject", "prompt_budget", 413, Decimal(caps.prompt_tokens_max), Decimal(0), req.model,
+                                (catalog.chain(req.model) or [UNKNOWN_ARM])[0].arm_id, (), False, tuple(actions), trim)
+    eff = replace(req, model=model, prompt_tokens=prompt)
+    spend = _decide_spend(eff, snap, caps, catalog)
+    spend = _high_cost_step(eff, spend, snap, caps, catalog)
+    if g3_code and spend.action == "allow":
+        spend = replace(spend, action="downgrade", code=g3_code, cap=Decimal(caps.prompt_tokens_max), explore_allowed=False)
+    elif trim and spend.action == "allow":
+        spend = replace(spend, code="prompt_trim", cap=Decimal(caps.prompt_tokens_max))
+    return replace(spend, actions=tuple(actions), trim_tokens=trim)
+
+
 # ----------------------------------------------------------------------------- spend counter
 def _dec(value: Any) -> Decimal:
     amount = Decimal(str(value))
@@ -449,7 +533,7 @@ class SpendCounter:
         self._hc_day = Decimal(0)
         self._buckets: dict[int, Decimal] = {}
         self._hc_calls: dict[int, int] = {}
-        self._inflight: dict[str, tuple[Decimal, str, float]] = {}
+        self._inflight: dict[str, tuple[Decimal, str, float, bool]] = {}
         self.denials: dict[str, int] = {}
         self.reservations_taken = 0
         self.save_failures = 0
@@ -559,7 +643,7 @@ class SpendCounter:
             del self._hc_calls[key]
 
     def _sweep(self, now: float) -> None:
-        for call_id in [c for c, (_, _, ts) in self._inflight.items() if now - ts > self._ttl]:
+        for call_id in [c for c, (_, _, ts, _) in self._inflight.items() if now - ts > self._ttl]:
             del self._inflight[call_id]
 
     def snapshot(self, now: float, client: str = ANONYMOUS) -> Snapshot:
@@ -568,8 +652,8 @@ class SpendCounter:
             self._roll_day(now)
             self._sweep(now)
             bucket = int(now // BUCKET_S)
-            inflight = sum((amount for amount, _, _ in self._inflight.values()), Decimal(0))
-            mine = sum((amount for amount, who, _ in self._inflight.values() if who == client), Decimal(0))
+            inflight = sum((held[0] for held in self._inflight.values()), Decimal(0))
+            mine = sum((held[0] for held in self._inflight.values() if held[1] == client), Decimal(0))
             rolling = sum((v for k, v in self._buckets.items() if bucket - BUCKETS_24H + 1 <= k <= bucket), Decimal(0))
             hour = sum((v for k, v in self._buckets.items() if bucket - BUCKETS_HOUR + 1 <= k <= bucket), Decimal(0))
             hc_calls = sum(n for k, n in self._hc_calls.items() if bucket - BUCKETS_HOUR + 1 <= k <= bucket)
@@ -580,7 +664,7 @@ class SpendCounter:
     def reserve(self, call_id: str, amount: Decimal, now: float, client: str = ANONYMOUS, hc: bool = False) -> None:
         with self._lock:
             self._ensure()
-            self._inflight[call_id] = (amount, client, now)
+            self._inflight[call_id] = (amount, client, now, hc)
             self.reservations_taken += 1
             if hc:
                 key = int(now // BUCKET_S)
@@ -603,7 +687,7 @@ class SpendCounter:
                 booked = held[0] if held is not None else Decimal(0)
                 self.settled_at_reservation += 1
             if held is not None:
-                client = held[1]
+                client, hc = held[1], hc or held[3]
                 if final:
                     del self._inflight[call_id]
             self._roll_day(now)
@@ -708,6 +792,124 @@ class FailOpenBreaker:
         return len(self._events) > self._limit
 
 
+# ----------------------------------------------------------------------------- grounding trim (G3)
+def _grounding_indexes(data: dict) -> list[int]:
+    from loci_litellm.grounding_hook import _OWN_CONTEXT_PREFIX
+
+    found: list[int] = []
+    messages = data.get("messages")
+    for index, message in enumerate(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("role") == "system" and isinstance(message.get("content"), str) \
+                and message["content"].lstrip().startswith(_OWN_CONTEXT_PREFIX):
+            found.append(index)
+    return found
+
+
+def grounding_tokens(data: dict) -> int:
+    """Estimated tokens of the retrieved-context system messages the grounding hook injected (chat requests)."""
+    messages = data.get("messages") or []
+    return sum((len(messages[i]["content"]) + 16 + 2) // 3 for i in _grounding_indexes(data))
+
+
+def trim_grounding(data: dict) -> int:
+    """Remove the injected retrieved-context messages. Returns how many were removed."""
+    indexes = _grounding_indexes(data)
+    for index in reversed(indexes):
+        del data["messages"][index]
+    return len(indexes)
+
+
+# ----------------------------------------------------------------------------- concurrency (G7)
+class ConcurrencyTimeout(Exception):
+    """No slot became free within the wait limit."""
+
+
+@dataclass(frozen=True)
+class Limits:
+    global_: int = 12
+    arm: int = 8        # per cloud alias
+    card: int = 2       # per local device
+
+
+class ConcurrencyLimiter:
+    """Counting semaphores per key ("global", "arm:<alias>", "card:<device>"), taken in the order given and
+    released in reverse. A slot is held under the call id until `release`; a slot nobody released for `slot_ttl_s`
+    is reclaimed on the next acquire. Whatever fails or is cancelled part-way through `acquire` gives back what it
+    had already taken."""
+
+    def __init__(self, limits: Limits = Limits(), wait_s: float = 30.0, *, clock: Callable[[], float] = time.time,
+                 slot_ttl_s: float = 1800.0, semaphore_factory: Callable[[int], Any] = asyncio.Semaphore) -> None:
+        self.limits = limits
+        self.wait_s = wait_s
+        self._clock = clock
+        self._ttl = slot_ttl_s
+        self._factory = semaphore_factory
+        self._sems: dict[str, Any] = {}
+        self._used: dict[str, int] = {}
+        self._held: dict[str, tuple[tuple[str, ...], float]] = {}
+        self.timeouts = 0
+        self.swept = 0
+
+    def limit_for(self, key: str) -> int:
+        if key == "global":
+            return self.limits.global_
+        return self.limits.card if key.startswith("card:") else self.limits.arm
+
+    def _sem(self, key: str) -> Any:
+        if key not in self._sems:
+            self._sems[key] = self._factory(self.limit_for(key))
+            self._used[key] = 0
+        return self._sems[key]
+
+    def would_wait(self, keys: Sequence[str]) -> bool:
+        return any(self._used.get(key, 0) >= self.limit_for(key) for key in keys)
+
+    def in_use(self, key: str) -> int:
+        return self._used.get(key, 0)
+
+    def _give_back(self, key: str) -> None:
+        self._sem(key).release()
+        self._used[key] -= 1
+
+    def _sweep(self) -> None:
+        now = self._clock()
+        for call_id in [c for c, (_, at) in self._held.items() if now - at > self._ttl]:
+            self.release(call_id)
+            self.swept += 1
+
+    async def acquire(self, call_id: str, keys: Sequence[str]) -> None:
+        self._sweep()
+        taken: list[str] = []
+        try:
+            for key in keys:
+                sem = self._sem(key)
+                try:
+                    async with asyncio.timeout(self.wait_s):
+                        await sem.acquire()
+                except TimeoutError as exc:
+                    self.timeouts += 1
+                    raise ConcurrencyTimeout(key) from exc
+                self._used[key] += 1
+                taken.append(key)
+            self._held[call_id] = (tuple(taken), self._clock())
+        except BaseException:
+            for key in reversed(taken):
+                self._give_back(key)
+            raise
+
+    def release(self, call_id: str) -> bool:
+        held = self._held.pop(call_id, None)
+        if held is None:
+            return False
+        for key in reversed(held[0]):
+            self._give_back(key)
+        return True
+
+    def stats(self) -> dict:
+        return {"in_use": {k: v for k, v in self._used.items() if v}, "held": len(self._held),
+                "timeouts": self.timeouts, "swept": self.swept}
+
+
 # ----------------------------------------------------------------------------- the governor
 Optimiser = Callable[[dict, "Context"], None]
 
@@ -739,7 +941,11 @@ class Governor:
                  stop: StopFiles, audit: Optional[AuditChain] = None,
                  mode: Union[str, Callable[[], str]] = MODE_OBSERVE, clock: Callable[[], float] = time.time,
                  optimisers: Sequence[Optimiser] = (), breaker: Optional[FailOpenBreaker] = None,
-                 event_sink: Optional[Callable[[dict], None]] = None) -> None:
+                 event_sink: Optional[Callable[[dict], None]] = None,
+                 limiter: Optional[ConcurrencyLimiter] = None,
+                 lease_validator: Optional[Callable[[str, str], bool]] = None) -> None:
+        self._limiter = limiter
+        self._lease_validator = lease_validator
         self._store = store
         self._envelope = envelope
         self._catalog = catalog
@@ -790,6 +996,8 @@ class Governor:
         out["stop_stat_errors"] = getattr(self._stop, "stat_errors", 0)
         if hasattr(self._store, "stats"):
             out["store"] = self._store.stats()
+        if self._limiter is not None:
+            out["concurrency"] = self._limiter.stats()
         return out
 
     def _emit(self, event: dict) -> bool:
@@ -812,12 +1020,21 @@ class Governor:
             return False
 
     # -- request side
-    def _build_request(self, data: dict, env: EnvelopeState, catalog: Catalog) -> Request:
+    def _build_request(self, data: dict, env: EnvelopeState, catalog: Catalog) -> tuple[Request, tuple[str, ...]]:
         metadata = _metadata(data)
-        return Request(model=str(data.get("model") or ""), prompt_tokens=estimate_prompt_tokens(data),
-                       max_tokens=data.get("max_tokens", data.get("max_completion_tokens")),
-                       has_tools=needs_tools(data), client=ANONYMOUS, interactive=False,
-                       rw=metadata.get("loci_rw") is True)
+        headers = _headers(data)
+        who = identify(headers, env.clients, env.caps.anonymous_day)
+        prompt_tokens = estimate_prompt_tokens(data)
+        token = headers.get(LEASE_HEADER)
+        lease_ok = bool(self._lease_validator is not None and isinstance(token, str) and token
+                        and self._lease_validator(who.name, token))
+        trimmable = grounding_tokens(data) if prompt_tokens > env.caps.prompt_tokens_max else 0
+        req = Request(model=str(data.get("model") or ""), prompt_tokens=prompt_tokens,
+                      max_tokens=data.get("max_tokens", data.get("max_completion_tokens")),
+                      has_tools=needs_tools(data), client=who.name, interactive=who.interactive,
+                      rw=who.rw or metadata.get("loci_rw") is True, client_cap=who.cap_day,
+                      lease_ok=lease_ok, trimmable_tokens=trimmable)
+        return req, who.notes
 
     def _is_exempt(self, data: dict, call_type: Any) -> bool:
         if str(call_type or "") in _EXEMPT_CALL_TYPES:
@@ -858,9 +1075,11 @@ class Governor:
                     decision = Decision("reject", "governor_degraded", 503, notes=("fail_open_breaker",), explore_allowed=False)
                 else:
                     catalog = self._catalog()
-                    req = self._build_request(data, env, catalog)
+                    req, id_notes = self._build_request(data, env, catalog)
                     snap = self._store.snapshot(now, req.client)
                     decision = decide(req, snap, env.caps, catalog)
+                    if id_notes:
+                        decision = replace(decision, notes=decision.notes + id_notes)
                     if env.level != "L0":
                         decision = replace(decision, notes=decision.notes + (f"envelope_{env.alarm}",))
         except Exception as exc:                  # G1/G7/G8 fail closed
@@ -874,13 +1093,19 @@ class Governor:
         metadata = _metadata(data)
         rw = bool(req and req.rw)
         client = req.client if req else ANONYMOUS
-        if decision.action != "allow":
-            event = {"event": "would_block" if mode == MODE_OBSERVE else "block" if decision.action == "reject" else "downgrade",
+        metadata["loci_client"] = client
+        if "client_unknown" in decision.notes:
+            self._count("client_unknown")
+            self._emit({"event": "client_unknown", "client": client, "mode": mode})
+        if decision.action != "allow" or decision.actions:
+            kind = {"reject": "block", "downgrade": "downgrade"}.get(decision.action, "adjust")
+            event = {"event": "would_block" if mode == MODE_OBSERVE else kind,
+                     "actions": list(decision.actions), "trim_tokens": decision.trim_tokens,
                      "code": decision.code, "action": decision.action, "status": decision.status,
                      "cap": None if decision.cap is None else format(decision.cap, "f"),
                      "reservation": format(decision.reservation, "f"), "model": data.get("model"),
-                     "target": decision.target_model, "client": client, "mode": mode, "notes": list(decision.notes)}
-            self._count("would_block" if mode == MODE_OBSERVE else "enforced_" + decision.action)
+                     "target": decision.target_model, "target_arm": decision.target_arm, "client": client, "mode": mode, "notes": list(decision.notes)}
+            self._count("would_block" if mode == MODE_OBSERVE else "enforced_" + kind)
             self._store.record_denial(decision.code)
             audited = self._emit(event)
         else:
@@ -898,6 +1123,8 @@ class Governor:
             if decision.action == "reject":
                 return GovernorRejection(decision.status, decision.code, _message(decision), decision.cap,
                                          headers={"Retry-After": "30"} if decision.status == 503 else None)
+            if "trim_grounding" in decision.actions:
+                metadata["loci_governor_trimmed"] = trim_grounding(data)
             if decision.action == "downgrade":
                 metadata["loci_governor_downgraded_from"] = data.get("model")
                 data["model"] = decision.target_model
@@ -907,13 +1134,57 @@ class Governor:
         # Observe mode lets a would-block request through, but still books its spend (reservation, then actual).
         metadata["loci_governor_id"] = call_id
         try:
-            self._store.reserve(call_id, decision.reservation, now, client)
+            self._store.reserve(call_id, decision.reservation, now, client, decision.high_cost)
         except Exception as exc:
             self._count("fail_closed_events")
             logger.warning("loci governor: reservation failed: %r", exc)
             if mode == MODE_ENFORCE:
                 return GovernorRejection(503, "budget_gate_error", "the spend gate could not reserve",
                                          headers={"Retry-After": "30"})
+        return None
+
+    # -- concurrency
+    def _slot_keys(self, model: str) -> list[str]:
+        arms = self._catalog().groups().get(model, [])
+        if arms and all(arm.local for arm in arms):
+            return ["global", "card:" + arms[0].card]
+        return ["global", "arm:" + model]
+
+    async def admit(self, data: dict, call_type: Any = None) -> Optional[GovernorRejection]:
+        """`process`, then a concurrency slot. In observe mode a full limiter is only recorded."""
+        rejection = self.process(data, call_type)
+        if rejection is not None or self._limiter is None:
+            return rejection
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        call_id = metadata.get("loci_governor_id")
+        if not call_id:
+            return None                                   # exempt
+        enforcing = metadata.get("loci_governor_mode") == MODE_ENFORCE
+        try:
+            keys = self._slot_keys(str(data.get("model") or ""))
+            if not enforcing:
+                if self._limiter.would_wait(keys):
+                    self._count("would_block")
+                    self._emit({"event": "would_block", "code": "concurrency", "client": metadata.get("loci_client"),
+                                "model": data.get("model"), "mode": MODE_OBSERVE})
+                return None
+            await self._limiter.acquire(str(call_id), keys)
+        except ConcurrencyTimeout as exc:
+            self.release(str(call_id))
+            self._count("enforced_reject")
+            self._store.record_denial("concurrency")
+            self._emit({"event": "block", "code": "concurrency", "key": str(exc), "client": metadata.get("loci_client"),
+                        "model": data.get("model"), "mode": MODE_ENFORCE})
+            return GovernorRejection(503, "concurrency", "too many calls in flight; retry shortly",
+                                     headers={"Retry-After": "5"})
+        except asyncio.CancelledError:
+            self.release(str(call_id))
+            raise
+        except Exception as exc:                          # G7 fails closed
+            self.release(str(call_id))
+            self._count("fail_closed_events")
+            logger.warning("loci governor: concurrency gate error: %r", exc)
+            return GovernorRejection(503, "budget_gate_error", "the concurrency gate failed", headers={"Retry-After": "30"})
         return None
 
     # -- settle side
@@ -923,13 +1194,18 @@ class Governor:
         except Exception as exc:
             self._count("settle_errors")
             logger.warning("loci governor: could not settle %s: %r", call_id, exc)
+        if final and self._limiter is not None:
+            self._limiter.release(call_id)
 
     def release(self, call_id: str) -> None:
+        """The call is over without a cost to book: give back its reservation and its concurrency slot."""
         try:
             self._store.release(call_id)
         except Exception as exc:
             self._count("settle_errors")
             logger.warning("loci governor: could not release %s: %r", call_id, exc)
+        if self._limiter is not None:
+            self._limiter.release(call_id)
 
 
 def _message(decision: Decision) -> str:
@@ -976,7 +1252,7 @@ class LociGovernor(CustomLogger):
         return self._governor
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> Any:
-        rejection = self.governor.process(data, call_type)
+        rejection = await self.governor.admit(data, call_type)
         if rejection is not None:
             raise rejection
         return None
@@ -1055,7 +1331,7 @@ def build_governor_from_env(clock: Callable[[], float] = time.time) -> Governor:
 
     return Governor(store=_LazyStore(), envelope=envelope, catalog=_litellm_catalog,
                     stop=StopFiles(str(base / "STOP"), str(base / "PAUSE"), clock=clock), audit=audit,
-                    mode=lambda: os.environ.get("LOCI_GOVERNOR", ""), clock=clock)
+                    mode=lambda: os.environ.get("LOCI_GOVERNOR", ""), clock=clock, limiter=ConcurrencyLimiter(clock=clock))
 
 
 loci_governor = LociGovernor()

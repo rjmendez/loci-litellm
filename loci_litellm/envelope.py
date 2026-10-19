@@ -166,6 +166,8 @@ def parse_envelope(raw: bytes, suffix: str = ".toml") -> tuple[Caps, bool, str, 
     if not isinstance(clients_in, dict):
         raise EnvelopeInvalid("[clients] must be a table")
     for name, entry in clients_in.items():
+        if name == "anonymous":
+            raise EnvelopeInvalid("client name 'anonymous' is reserved for unidentified callers")
         if not isinstance(entry, dict) or not isinstance(entry.get("secret_sha256"), str) or len(entry["secret_sha256"]) != 64:
             raise EnvelopeInvalid(f"client {name!r} needs a 64-hex secret_sha256")
         cap = entry.get("cap_day")

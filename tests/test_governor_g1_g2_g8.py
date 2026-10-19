@@ -60,13 +60,13 @@ def test_boundary_exactly_at_the_hard_cap_is_allowed_and_one_cent_over_is_denied
 def test_governor_denies_at_39_99_and_reserves_at_39_00_with_a_recording_store(tmp_path: Path) -> None:
     c = caps(day_soft=D("40"), day_hard=D("40.00"))
     denied_store = RecordingStore(snap=snap(day_total="39.99"))
-    rejection = make_governor(tmp_path, denied_store, c).process(body(tokens=1000, tools=True))
+    rejection = make_governor(tmp_path, denied_store, c, cat=catalog(BIG)).process(body(tokens=1000, tools=True))
     assert isinstance(rejection, GovernorRejection)
     assert (rejection.status_code, rejection.code, rejection.body["error"]["cap"]) == (429, "budget_day", "40.00")
     assert (denied_store.denials, denied_store.reservations) == (["budget_day"], [])
 
     ok_store = RecordingStore(snap=snap(day_total="39.00"))
-    assert make_governor(tmp_path, ok_store, c).process(body(tokens=1000, tools=True)) is None
+    assert make_governor(tmp_path, ok_store, c, cat=catalog(BIG)).process(body(tokens=1000, tools=True)) is None
     assert (ok_store.denials, ok_store.reservations) == ([], [(D("0.02"), "anonymous", False)])
 
 

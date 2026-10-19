@@ -63,7 +63,8 @@ class RecordingStore:
 def caps(**overrides: Any) -> Caps:
     """Defaults with generous other lines, so a test only trips the line it sets."""
     base = replace(DEFAULT_CAPS, day_soft=D("1000"), day_hard=D("1000"), rolling_24h=D("1000"),
-                   hour_downgrade=D("1000"), hour_reject=D("1000"), interactive_stop=D("1000"))
+                   hour_downgrade=D("1000"), hour_reject=D("1000"), interactive_stop=D("1000"),
+                   prompt_tokens_max=10**9, high_cost_share=D("1000"))
     return replace(base, **overrides)
 
 
