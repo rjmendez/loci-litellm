@@ -89,6 +89,7 @@ litellm_settings:
     - loci_litellm.circuit_monitor.loci_circuit_monitor
     - loci_litellm.cost_ledger.loci_cost_ledger
     - loci_litellm.capability_gate.loci_capability_gate   # inert until LOCI_GATE_*_EXCLUDE_TAGS is set
+    # - loci_litellm.colony_router.loci_colony_router   # shadow router: does nothing until LOCI_ROUTER_SHADOW=1; routes only with LOCI_ROUTER_CANARY_SHARE > 0 and a valid LOCI_ROUTER_SNAPSHOT
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
