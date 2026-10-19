@@ -5,10 +5,24 @@ in the LiteLLM config; LOCI_COST_LEDGER_DISABLED=1 turns it off.
 
 Row fields (complete set): ts, call_id, trace_id, group, deployment, model, host, local, ok,
 call_type, stream, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
-empty_response, cost_usd, latency_s, cache_hit, error_class, internal, grounding, agent (first 60
-chars of the User-Agent), key_alias. `agent` and `key_alias` identify callers: the file is sensitive.
+empty_response, empty_suspect_stream, cost_usd, latency_s, cache_hit, error_class, internal, grounding,
+agent (first 60 chars of the User-Agent), key_alias, session_id, has_tools, task_class, prefix_hash,
+max_tokens, client_id, config_hash, cache_regime, finish_reason. `agent`, `key_alias` and `client_id`
+identify callers: the file is sensitive.
 cache_*_tokens are provider-reported and included in prompt_tokens; empty_response means a
-successful call with no answer text and no tool call; latency_s is null when unknown. `local` is
+successful call with no answer text and no tool call (a streamed call that reported 0 completion tokens is
+labelled empty_suspect_stream instead (a key written only when true): usage is often missing on streams, so it is unverified, not a
+failure, and stays out of empty_response); latency_s is null when unknown.
+Correlation fields (never any prompt or response text): session_id is the first 12 hex characters of the
+sha256 of the caller's session id (empty when none), never the raw id; has_tools is true when the request
+offered tools or functions; task_class, client_id and prefix_hash are labels a router or hook put in the
+request metadata (`loci_task_class`, `loci_client_id`, `loci_prefix_hash`; empty when absent, truncated to
+24, 32 and 12 characters; prefix_hash is computed from the request by loci_litellm.prefix_hash when the
+metadata has none, unless LOCI_LEDGER_PREFIX_HASH=0); max_tokens is the requested output cap (null when unset); config_hash is
+LOCI_CONFIG_HASH, else the first 12 hex characters of the sha256 of the file named by CONFIG_FILE_PATH
+(empty when neither is usable); cache_regime is the operator label in LOCI_CACHE_REGIME (empty when
+unset); finish_reason is the first choice's finish reason (empty when unknown or the call failed).
+`local` is
 an address-class heuristic on the api_base host (loopback, link-local, private, CGNAT, localhost, or
 a host in LOCI_LOCAL_HOSTS, comma separated). Calls with no group and no api_base are "(unrouted)".
 File: LOCI_COST_LEDGER_FILE, else `[cost] ledger_file` in the private config, else
@@ -18,6 +32,7 @@ unbounded) it rotates to <file>.1. Write failures log a WARNING and never fail t
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -31,6 +46,7 @@ from urllib.parse import urlparse
 from litellm.integrations.custom_logger import CustomLogger
 from loci_litellm.backend_resolver import BackendResolver, ledger_path  # noqa: F401  (re-exported)
 from loci_litellm.fileutil import append_line, env_int
+from loci_litellm.prefix_hash import prefix_hash, request_of
 
 logger = logging.getLogger("loci_litellm.cost_ledger")
 
@@ -131,16 +147,16 @@ def _cache_tokens(response_obj: Any, slo: dict) -> tuple[int, int]:
     return int(_num(read)), int(_num(write))
 
 
-def _is_empty_response(call_type: str, response_obj: Any, slo: dict) -> bool:
-    """True when a successful call returned no answer text and no tool call. False for non-text
-    call types and unknown response shapes."""
+def _text_state(call_type: str, response_obj: Any) -> str:
+    """"text" when the response carries answer text or a tool call, "empty" when it has chat-completion
+    choices that carry neither, "unknown" for non-text call types and shapes without choices."""
     if call_type not in _COMPLETION_CALLS or response_obj is None:
-        return False
+        return "unknown"
     choices = getattr(response_obj, "choices", None)
     if choices is None and isinstance(response_obj, dict):
         choices = response_obj.get("choices")
     if not choices:
-        return False                      # not a chat-completion shape
+        return "unknown"                  # not a chat-completion shape
     for choice in choices:
         message = _field(choice, "message") or _field(choice, "delta")
         text = _field(message, "content") if message is not None else None
@@ -149,10 +165,101 @@ def _is_empty_response(call_type: str, response_obj: Any, slo: dict) -> bool:
         if isinstance(text, list):
             text = "".join(str(_field(part, "text") or "") for part in text)
         if isinstance(text, str) and text.strip():
-            return False
+            return "text"
         if message is not None and (_field(message, "tool_calls") or _field(message, "function_call")):
-            return False
-    return True
+            return "text"
+    return "empty"
+
+
+def _first_finish_reason(response_obj: Any) -> str:
+    choices = getattr(response_obj, "choices", None)
+    if choices is None and isinstance(response_obj, dict):
+        choices = response_obj.get("choices")
+    if not choices or not isinstance(choices, (list, tuple)):
+        return ""
+    return str(_field(choices[0], "finish_reason") or "")[:_FINISH_LEN]
+
+
+_SESSION_HASH_LEN = 12
+_PREFIX_LEN = 12
+_TASK_CLASS_LEN = 24
+_CLIENT_ID_LEN = 32
+_CONFIG_HASH_LEN = 12
+_CACHE_REGIME_LEN = 24
+_FINISH_LEN = 20
+
+
+def _session_hash(session_id: Any) -> str:
+    """Truncated sha256 of a session id: enough to group one session's calls, not enough to recover or
+    replay the id."""
+    raw = str(session_id or "").strip()
+    if not raw:
+        return ""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_SESSION_HASH_LEN]
+
+
+_config_hash_cache: dict = {}
+
+
+def _config_hash() -> str:
+    """LOCI_CONFIG_HASH, else a hash of the proxy config file (re-read only when its size or mtime
+    changes); empty, with a throttled warning, when the file is named but unreadable."""
+    explicit = os.environ.get("LOCI_CONFIG_HASH", "").strip()
+    if explicit:
+        return explicit[:_CONFIG_HASH_LEN]
+    path = os.environ.get("CONFIG_FILE_PATH", "").strip()
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        if _config_hash_cache.get("key") != key:
+            digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()[:_CONFIG_HASH_LEN]
+            _config_hash_cache.update(key=key, value=digest)
+        return str(_config_hash_cache["value"])
+    except OSError as exc:
+        _warn_throttled("config_hash", "loci cost ledger: could not hash the proxy config: %r", exc)
+        return ""
+
+
+def _meta_str(sources: tuple, names: tuple, limit: int) -> str:
+    for source in sources:
+        if isinstance(source, dict):
+            for name in names:
+                value = source.get(name)
+                if value:
+                    return str(value)[:limit]
+    return ""
+
+
+def _request_prefix_hash(kwargs: dict) -> str:
+    """Hash of the request's cacheable prefix (see prefix_hash), computed here when no hook supplied one.
+    LOCI_LEDGER_PREFIX_HASH=0 turns the computation off; a failure leaves the field empty and is counted in
+    the throttled warning."""
+    if os.environ.get("LOCI_LEDGER_PREFIX_HASH", "1").strip().lower() in ("0", "false", "no", "off"):
+        return ""
+    try:
+        return prefix_hash(request_of(kwargs))[:_PREFIX_LEN]
+    except Exception as exc:
+        _warn_throttled("prefix_hash", "loci cost ledger: could not hash the request prefix: %r", exc)
+        return ""
+
+
+def _max_tokens(slo: dict, kwargs: dict) -> Optional[int]:
+    for source in (slo.get("model_parameters"), kwargs.get("optional_params")):
+        if isinstance(source, dict):
+            for name in ("max_completion_tokens", "max_tokens"):
+                value = source.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                    return int(value)
+    return None
+
+
+def _has_tools(slo: dict, kwargs: dict) -> bool:
+    for source in (kwargs.get("optional_params"), slo.get("model_parameters"), kwargs):
+        if isinstance(source, dict) and (source.get("tools") or source.get("functions")):
+            return True
+    return False
 
 
 def _num(value: Any) -> float:
@@ -188,7 +295,15 @@ class LociCostLedger(CustomLogger):
         error = slo.get("error_information") if isinstance(slo.get("error_information"), dict) else {}
         call_type = str(slo.get("call_type") or kwargs.get("call_type") or "")
         cache_read, cache_write = _cache_tokens(response_obj, slo)
-        return {
+        streamed = bool(slo.get("stream") or kwargs.get("stream"))
+        completion_tokens = int(_num(slo.get("completion_tokens")))
+        state = _text_state(call_type, response_obj)
+        # A stream that reports no completion tokens and shows no text cannot be told from a stream whose
+        # usage was simply not reported: label it suspect instead of counting a failed answer.
+        suspect = (bool(ok) and streamed and call_type in _COMPLETION_CALLS
+                   and completion_tokens == 0 and state != "text")
+        sources = (meta_params, meta_slo, requester)
+        row: dict[str, Any] = {
             "ts": round(time.time(), 3),
             "call_id": str(slo.get("litellm_call_id") or kwargs.get("litellm_call_id") or ""),
             "trace_id": str(slo.get("trace_id") or ""),
@@ -200,12 +315,12 @@ class LociCostLedger(CustomLogger):
                                           str(slo.get("model") or kwargs.get("model") or ""), api_base),
             "ok": bool(ok),
             "call_type": call_type,
-            "stream": bool(slo.get("stream") or kwargs.get("stream")),
+            "stream": streamed,
             "prompt_tokens": int(_num(slo.get("prompt_tokens"))),
-            "completion_tokens": int(_num(slo.get("completion_tokens"))),
+            "completion_tokens": completion_tokens,
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
-            "empty_response": bool(ok) and _is_empty_response(call_type, response_obj, slo),
+            "empty_response": bool(ok) and state == "empty" and not suspect,
             "cost_usd": _num(slo.get("response_cost") or kwargs.get("response_cost")),
             "latency_s": None if latency is None else round(latency, 3),
             "cache_hit": bool(slo.get("cache_hit")),
@@ -214,7 +329,20 @@ class LociCostLedger(CustomLogger):
             "grounding": str(meta_params.get("loci_grounding_status") or ""),
             "agent": str(slo.get("user_agent") or "")[:60],
             "key_alias": str(meta_slo.get("user_api_key_alias") or ""),
+            "session_id": _session_hash(slo.get("session_id") or _meta_str(sources, ("session_id",), 256)),
+            "has_tools": _has_tools(slo, kwargs),
+            "task_class": _meta_str(sources, ("loci_task_class", "task_class"), _TASK_CLASS_LEN),
+            "prefix_hash": (_meta_str(sources, ("loci_prefix_hash",), _PREFIX_LEN)
+                            or _request_prefix_hash(kwargs)),
+            "max_tokens": _max_tokens(slo, kwargs),
+            "client_id": _meta_str(sources, ("loci_client_id", "client_id"), _CLIENT_ID_LEN),
+            "config_hash": _config_hash(),
+            "cache_regime": os.environ.get("LOCI_CACHE_REGIME", "").strip()[:_CACHE_REGIME_LEN],
+            "finish_reason": _first_finish_reason(response_obj) if ok else "",
         }
+        if suspect:
+            row["empty_suspect_stream"] = True      # written only when true: keeps the common row small
+        return row
 
     @staticmethod
     def _append(row: dict[str, Any]) -> None:

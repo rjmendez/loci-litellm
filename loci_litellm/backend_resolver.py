@@ -205,6 +205,21 @@ class BackendResolver:
         return tuple(v.strip() for v in values if isinstance(v, str) and v.strip())
 
     @staticmethod
+    def prefix_strip_markers() -> Optional[tuple[str, ...]]:
+        """Markers prefix_hash removes before hashing: `[cache] prefix_strip_markers = [...]` in the config or
+        LOCI_PREFIX_STRIP_MARKERS ('||' separated). None when neither is set (the module's defaults apply); a
+        set-but-empty value is an empty tuple (strip nothing)."""
+        raw = os.environ.get("LOCI_PREFIX_STRIP_MARKERS")
+        if raw is not None:
+            values: list = raw.split("||")
+        else:
+            configured = _cfg("cache", "prefix_strip_markers", None)
+            if configured is None:
+                return None
+            values = configured if isinstance(configured, list) else [configured]
+        return tuple(v.strip() for v in values if isinstance(v, str) and v.strip())
+
+    @staticmethod
     def client_rag_trusted() -> bool:
         return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
 

@@ -12,6 +12,9 @@ the reliability bar.
     price report null ("n/a").
   - Latency percentiles are over successful local calls; null latencies are skipped.
   - ok% counts a successful but empty response (`empty_response`) as a failure; `empty` is over all calls.
+    A streamed call with 0 reported completion tokens and no text (`empty_suspect_stream`) is not a failure;
+    it is counted separately as `empty_suspect_streams` in the --json summary. Rows written before the
+    correlation fields existed (session_id, prefix_hash, ...) read exactly as before.
   - cache% is cache_read_tokens / prompt_tokens as reported by the provider.
   - Internal calls are included unless --exclude-internal.
   - SLO: LOCI_LOCAL_SLO_SUCCESS (0.98), LOCI_LOCAL_SLO_P95_S (20), LOCI_LOCAL_SLO_MIN_CALLS (50).
@@ -139,6 +142,7 @@ def summarise(rows: Iterable[dict], prices: dict, include_internal: bool = True)
             "local_failures": sorted({r.get("error_class") or "?" for r in local_rows if not r.get("ok")}),
             "empty_responses": sum(1 for r in all_rows if r.get("empty_response")),
             "local_empty_responses": sum(1 for r in local_rows if r.get("empty_response")),
+            "empty_suspect_streams": sum(1 for r in all_rows if r.get("empty_suspect_stream")),
             "prompt_tokens": prompt_total,
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
