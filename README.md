@@ -134,6 +134,13 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_CAPABILITY_GATE_DISABLED` | unset | `1` (or `true`/`yes`/`on`) stops the gate from tagging requests. Per call. |
 | `LOCI_GATE_TOOLS_EXCLUDE_TAGS` | empty | Comma-separated deployment tags to exclude (`!<tag>`) for requests with tool definitions or tool turns. Empty: tools are not gated. Per call. |
 | `LOCI_GATE_IMAGES_EXCLUDE_TAGS` | empty | Same for requests with image content parts. Per call. |
+| `LOCI_ROUTER_SHADOW` | unset | `1` (or `true`/`yes`/`on`) turns on the shadow router callback. Unset: the callback does nothing. See "Colony router (shadow)". Per call. |
+| `LOCI_ROUTER_LEARN_DIR` | unset | Directory for `shadow_rows.jsonl` (decision and outcome rows, no prompt text). Unset: rows stay in a bounded in-memory queue. Per call. |
+| `LOCI_ROUTER_ROWS_MAX_BYTES` | `20000000` | At this size the rows file is renamed to `<file>.1`. `0` disables rotation. Per call. |
+| `LOCI_ROUTER_EPSILON` | `0.05` | Exploration rate of the shadow decision; clamped to `0.05`. Per call. |
+| `LOCI_ROUTER_DAILY_CAP_USD` | `50` | Daily cap used for the per-provider 45% share constraint (decimal dollars). |
+| `LOCI_ROUTER_PAUSE_FILE` | unset | If this path exists, exploration is 0. |
+| `LOCI_ROUTER_EXCLUDE_PROVIDERS` | empty | Comma-separated extra LiteLLM provider prefixes that are never routing arms (seat-billed providers are always excluded). |
 | `LOCI_LOCAL_HOSTS` | empty | Comma-separated hostnames counted as `local` in the ledger. Without it only loopback, private, link-local and `100.64.0.0/10` addresses and `localhost` are local; any other hostname counts as cloud. Per call. |
 | `LOCI_LOCAL_PROVIDERS` | empty | Comma-separated LiteLLM provider prefixes (for example `ollama,vllm`) whose deployments count as `local` in the ledger whatever their host name. Per call. |
 | `LOCI_LOCAL_SLO_SUCCESS`, `_P95_S`, `_MIN_CALLS` | `0.98`, `20`, `50` | Thresholds used by `cost_report`. |
@@ -197,6 +204,29 @@ to `metadata.tags` and sets `metadata.loci_capability_gate` to the capabilities 
 or the request body, and an internal error is logged at WARNING and ignored. It writes only to `metadata`; whether
 routes that carry `litellm_metadata` instead (for example Anthropic `/v1/messages`) honour the tags has not been
 verified.
+
+## Colony router (shadow)
+
+`loci_litellm.colony_router.loci_colony_router` is a shadow-only router. With `LOCI_ROUTER_SHADOW=1` it records which
+deployment it WOULD choose for each request and never changes the model, the messages or the metadata.
+
+- Arms are the deployments in the proxy's model list; price and tool support come from `model_info`. Entries with
+  `model_info.loci_router_arm: false` or `seat_billed: true`, non-chat models, and seat-billed providers are not arms.
+- The safe set drops arms in an open failure quorum (3 transient failures from 2 callers within 2 minutes), arms of a
+  provider whose spend today has reached 45% of the daily cap (needs a spend view; without one the row says
+  `share_cap: unavailable`), and tool-less arms for requests with tools.
+- Choice is epsilon-greedy over the posterior mean with the exact propensity `(1-eps)*1[a=a*] + eps/n` in each row.
+  Epsilon is 0 at governor level >= 1, with the pause file, at resource < 0.35, and for requests with tools, a cached
+  prefix, a delegated write or a later turn. A Thompson row (Monte-Carlo propensity from >= 200 draws) is logged
+  beside it; it never drives a choice.
+- 10% of sessions (a stable hash of the session id, never per call) are control: they stay on the model the request
+  names. A request with no session id is control.
+- Failures that are not provider health (400, 401, 403, 404) never raise the alarm channel.
+
+Session id, task class and tier come from `metadata.session_id` / `task_class` / `tier` or the `x-loci-session`,
+`x-loci-task-class`, `x-loci-tier` headers; a delegated read-write run is flagged by `metadata.delegated_write` or
+`x-loci-delegation: rw`. `ColonyRouter.stats()` counts every degraded condition (no arms, no safe arm, no session, no
+spend view, dropped rows, write errors).
 
 ## License
 
