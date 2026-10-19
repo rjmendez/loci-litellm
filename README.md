@@ -7,7 +7,7 @@ LiteLLM proxy callbacks that read from and write to a Qdrant-backed memory store
 | grounding hook | `grounding_hook.loci_grounding_hook` | Before a call, retrieves matching records from Qdrant and puts them in the request's instruction slot. |
 | memory writer | `memory_writer.loci_memory_writer` | After a successful call, writes a prompt/answer preview into a Qdrant collection. |
 | circuit monitor | `circuit_monitor.loci_circuit_monitor` | Counts consecutive transient failures per model group and logs when a circuit opens. Advisory: it does not change routing. |
-| cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it (offline: it does not need LiteLLM installed). |
+| cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it (offline: it does not need LiteLLM installed). `python -m loci_litellm.cache_regime_report --split YYYY-MM-DD` compares cache-read share before and after a date for grounded and ungrounded calls (read-only measurement). |
 | capability gate | `capability_gate.loci_capability_gate` | Adds `!<tag>` request tags to requests that carry tools or images, so the router skips deployments that lack the capability. Does nothing until you configure the tags (see below). |
 
 `loci_litellm.__version__` is read from `pyproject.toml` in a source checkout, else from installed metadata. It and
@@ -133,6 +133,10 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_COST_LEDGER_DISABLED` | unset | `1` stops the ledger once registered. Per call. |
 | `LOCI_CONFIG_HASH` | unset | Label written to the ledger as `config_hash` (first 12 characters). Unset: a hash of the file named by `CONFIG_FILE_PATH`, re-read when its size or mtime changes; empty if neither is usable. Per call. |
 | `LOCI_CACHE_REGIME` | unset | Free-form label (24 characters) written to every ledger row as `cache_regime`, so a change of caching setup can be told apart in later analysis. Per call. |
+| `LOCI_LEDGER_PREFIX_HASH` | `1` | `0` stops the ledger computing `prefix_hash` from the request when no hook put one in the metadata. Per call. |
+| `LOCI_PREFIX_STRIP_MARKERS` | unset (built-in list) | `\|\|`-separated markers `prefix_hash` removes before hashing: `open=>close` removes each span, a plain marker removes its block (a whole system part, or up to the next blank line). Empty strips nothing. Also `[cache] prefix_strip_markers` in the private config. Per call. |
+| `LOCI_ARM_DWELL` | unset (off) | `1` lets `DwellTracker` keep requests with one prefix hash on one arm; nothing calls the tracker until a router does. |
+| `LOCI_ARM_DWELL_SECONDS`, `LOCI_ARM_DWELL_ALARM` | `300`, `0.6` | Dwell length in seconds, and the alarm score above which a pinned arm is abandoned. |
 | `LOCI_CAPABILITY_GATE_DISABLED` | unset | `1` (or `true`/`yes`/`on`) stops the gate from tagging requests. Per call. |
 | `LOCI_GATE_TOOLS_EXCLUDE_TAGS` | empty | Comma-separated deployment tags to exclude (`!<tag>`) for requests with tool definitions or tool turns. Empty: tools are not gated. Per call. |
 | `LOCI_GATE_IMAGES_EXCLUDE_TAGS` | empty | Same for requests with image content parts. Per call. |

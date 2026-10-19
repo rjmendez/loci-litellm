@@ -85,7 +85,8 @@ def test_a_streamed_call_row_carries_exactly_the_new_keys(monkeypatch: pytest.Mo
     }
 
 
-def test_a_row_with_no_extra_metadata_has_the_empty_defaults() -> None:
+def test_a_row_with_no_extra_metadata_has_the_empty_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCI_LEDGER_PREFIX_HASH", "0")       # the request has messages; do not compute a hash
     kw = _kwargs(session="", tools=False, max_tokens=0, meta={"loci_task_class": "", "loci_client_id": "",
                                                               "loci_prefix_hash": ""})
     row = _row(kw, response=NS(choices=[NS(message=NS(content="x", tool_calls=None))], usage=None))
