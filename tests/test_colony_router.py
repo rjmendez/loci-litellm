@@ -167,6 +167,26 @@ def test_epsilon_is_capped_by_the_pinned_envelope() -> None:
     assert make_router(epsilon=0.03).epsilon == 0.03
 
 
+def test_the_default_exploration_rate_is_exactly_five_percent_even_under_a_looser_envelope() -> None:
+    # The envelope clamps a too-high rate, which hides the default itself: raising EPS_MAX to 0.06 passed every test.
+    # A looser envelope shows the real default.
+    loose = cr.Caps(eps_max=Decimal("0.5"))
+    assert make_router(caps=loose).epsilon == 0.05
+    assert make_router(caps=loose, epsilon=0.3).epsilon == 0.3          # twin: an explicit rate under that envelope is honoured
+    assert make_router().epsilon == 0.05                                # the pinned envelope agrees
+
+
+def test_an_unparseable_epsilon_in_the_environment_falls_back_to_the_default(monkeypatch) -> None:
+    # a looser envelope, so the fallback value itself is visible instead of being clamped to 0.05 either way
+    monkeypatch.setattr(cr.Caps, "from_env", classmethod(lambda cls: cls(eps_max=Decimal("0.5"))))
+    monkeypatch.setenv("LOCI_ROUTER_EPSILON", "not-a-number")
+    assert cr._router_from_env().epsilon == 0.05
+    monkeypatch.setenv("LOCI_ROUTER_EPSILON", "0.3")                    # twin: a valid value is used, not the default
+    assert cr._router_from_env().epsilon == 0.3
+    monkeypatch.delenv("LOCI_ROUTER_EPSILON")
+    assert cr._router_from_env().epsilon == 0.05
+
+
 # --- Thompson shadow rows ---
 
 def test_thompson_row_has_a_monte_carlo_propensity_from_200_draws() -> None:
