@@ -9,6 +9,7 @@ LiteLLM proxy callbacks that read from and write to a Qdrant-backed memory store
 | circuit monitor | `circuit_monitor.loci_circuit_monitor` | Counts consecutive transient failures per model group and logs when a circuit opens. Advisory: it does not change routing. |
 | cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it (offline: it does not need LiteLLM installed). `python -m loci_litellm.cache_regime_report --split YYYY-MM-DD` compares cache-read share before and after a date for grounded and ungrounded calls (read-only measurement). |
 | capability gate | `capability_gate.loci_capability_gate` | Adds `!<tag>` request tags to requests that carry tools or images, so the router skips deployments that lack the capability. Does nothing until you configure the tags (see below). |
+| governor | `governor.loci_governor` | Spend guard: reserves a worst-case cost before each call against day, rolling-24h, hourly and per-client caps, with STOP/PAUSE files and a hash-chained audit log. Observe-only unless the owner envelope turns enforcement on (see "Governor" below). |
 
 `loci_litellm.__version__` is read from `pyproject.toml` in a source checkout, else from installed metadata. It and
 the package path are logged once at INFO on import.
@@ -203,6 +204,56 @@ to `metadata.tags` and sets `metadata.loci_capability_gate` to the capabilities 
 or the request body, and an internal error is logged at WARNING and ignored. It writes only to `metadata`; whether
 routes that carry `litellm_metadata` instead (for example Anthropic `/v1/messages`) honour the tags has not been
 verified.
+
+## Governor
+
+`governor.loci_governor` is a spend guard. It is **observe-only by default**: it books spend and records what it
+would have refused (`would_block` events in the log and the audit chain) but never blocks, downgrades or edits a
+request. Registering it is therefore safe; nothing is read or written until the first request.
+
+State lives in `LOCI_GOVERNOR_DIR` (default `~/.loci/governor`): `counter.json` (the Governor's own spend counter, under
+4 KiB, written through a temp file and a rename, seeded from the cost ledger and its `.1` and never lowered by a ledger
+rotation), `STOP`, `PAUSE`, `envelope.toml`, `envelope.pin` and `audit/`.
+
+| Variable | Meaning |
+|---|---|
+| `LOCI_GOVERNOR` | `observe` (default; anything other than `enforce` is observe) or `enforce`. `enforce` takes effect only if the owner envelope is present, pinned and has `[governor] enforce = true`. |
+| `LOCI_GOVERNOR_DIR` | State directory (above). |
+| `LOCI_GOVERNOR_LEDGER` | Cost ledger used to seed the counter (default: the cost ledger's own path). |
+| `LOCI_GOVERNOR_OWNER_KEY_FILE` | File with the owner's HMAC key; a matching signed `envelope_pin` entry in the audit chain accepts an envelope whose hash differs from the pin file. |
+
+The envelope (`envelope.toml`, or `.json`) holds the caps, the enforce flag, the day timezone and the client table.
+Its sha256 is compared with the pin on every re-check (60 s); one changed byte, a missing, unpinned or malformed file
+means the built-in defaults, level `L3` and an alarm (`caps_hash_mismatch`, `envelope_missing`, `envelope_unpinned`,
+`envelope_invalid`). Which accounts may write the files is an operating-system matter; the module only detects. Built-in
+caps (dollars): local-day soft 30 and hard 50, rolling 24 h 60, hourly 10 (downgrade) and 25 (reject non-interactive),
+interactive absolute stop 75. The day is the machine's local calendar day (DST-aware) unless `day_timezone` names a zone.
+
+With enforcement on, a tool-carrying request over a hard cap gets HTTP 429 with `reason` and `cap`; a tool-free one goes
+to the cheapest adequate arm if that fits under the cap; interactive callers are downgraded, never rejected, until the
+absolute stop. The spend path fails closed (503 `budget_gate_error`); only optimisation steps fail open, counted in
+`stats()`, and more than five such events in 60 s make the Governor fail closed (`governor_degraded`). `STOP` answers 503
+`stopped` (health and ZERO-tier calls pass); `PAUSE` only switches off learning and exploration. Remove the callback or set
+`LOCI_GOVERNOR=observe` to roll back.
+
+Enforcement also covers:
+
+- **Per-client caps.** A caller names itself with `x-loci-client` and proves it with `x-loci-client-secret`; the envelope
+  stores only the sha256 of each secret (`[clients.<name>] secret_sha256`, `cap_day`, `interactive`, `rw`). A wrong or
+  missing secret is attributed to the `anonymous` bucket (its own cap, `anonymous_day`) and flagged `client_unknown`.
+  There is no LiteLLM database and no virtual key: in the proxy tree this was written against, a non-master key with no
+  database answers `No connected db.` (`user_api_key_auth.py`), so per-client caps live in the Governor.
+- **Prompt budget.** A cloud request over `prompt_tokens_max` (default 60,000) without a large-context lease has its
+  injected retrieved context trimmed first, then is downgraded to the cheapest adequate arm, then is refused (413,
+  `prompt_budget`). A lease is a token in `x-loci-lease` accepted by the `lease_validator` given to `Governor`; with none
+  configured no lease is ever valid. Local arms are exempt.
+- **High-cost share.** Arms are ranked by `model_info` price (never by name). A request for the top-ranked alias moves one
+  rank down when that rank's spend today passes `high_cost_share` of the daily hard cap or it has had
+  `high_cost_calls_per_hour` calls this hour; with no adequate lower arm the request stays put and is flagged.
+- **Concurrency.** Semaphores: 12 global, 8 per cloud alias, 2 per local device (`loci_card` in `model_info`, else the
+  api_base host). A call waits up to 30 s, then answers 503 `concurrency` with `Retry-After`; the slot is released when
+  the call succeeds, fails, is cancelled or errors in the Governor, and a slot nobody released is reclaimed after 30 min.
+  In observe mode a full limiter is only recorded.
 
 ## License
 
