@@ -114,6 +114,7 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_PHERO_BETA` | `0.08` | Weight of the logarithmic pheromone term in the score. |
 | `LOCI_PHERO_HALFLIFE_H` | `24` | Pheromone decay half-life, hours. |
 | `LOCI_PHERO_DEPOSIT` | `1.0` | Amount added to a returned record's pheromone. |
+| `LOCI_PHERO_MAX` | `10.0` | Ceiling on a record's stored pheromone, so a hot (or poisoned) record cannot grow it without bound. |
 | `LOCI_PHERO_DEPOSIT_DISABLED` | unset | `1` makes grounding read-only. Per call. |
 | `LOCI_CLIENT_RAG_OK_MARKERS` | empty (or `[grounding] client_rag_ok_markers`) | `\|\|`-separated strings; a request containing one is not grounded. Per call. |
 | `LOCI_TRUST_CLIENT_RAG` | `1` | `0` ignores those markers. Per call. |

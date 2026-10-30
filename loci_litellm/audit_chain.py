@@ -67,7 +67,9 @@ def _open_text(path: Path, mode: str = "rt"):
 class AuditChain:
     def __init__(self, directory: str, name: str = "audit", *, segment_bytes: int = 16 * 1024 * 1024,
                  max_total_bytes: int = 256 * 1024 * 1024, gzip_after_days: float = 7.0,
-                 delete_after_days: float = 60.0, clock: Callable[[], float] = time.time) -> None:
+                 delete_after_days: float = 60.0, clock: Callable[[], float] = time.time,
+                 fsync_mode: str = "interval", fsync_interval_s: float = 1.0,
+                 maintenance_interval_s: float = 3600.0) -> None:
         self.dir = Path(directory)
         self.name = name
         self.segment_bytes = segment_bytes
@@ -75,12 +77,21 @@ class AuditChain:
         self.gzip_after_days = gzip_after_days
         self.delete_after_days = delete_after_days
         self._clock = clock
+        # Durability policy for the per-append fsync. "always" fsyncs every write (strongest, but a
+        # per-request fsync on the proxy's event-loop thread); "interval" fsyncs at most once per
+        # fsync_interval_s (bursts are batched; at most that window of entries is at risk on a crash, and
+        # the head anchor still detects the truncation on the next verify()); "never" leaves it to the OS.
+        self.fsync_mode = fsync_mode if fsync_mode in ("always", "interval", "never") else "interval"
+        self.fsync_interval_s = fsync_interval_s
+        self.maintenance_interval_s = maintenance_interval_s
         self._lock = threading.Lock()
         self._loaded = False
         self._seq = -1
         self._hash = GENESIS
         self._active_first_seq: Optional[int] = None
         self._active_last_ts = 0.0
+        self._last_fsync = 0.0
+        self._next_maint_ts = 0.0
 
     # ------------------------------------------------------------------ paths
     @property
@@ -236,8 +247,19 @@ class AuditChain:
         os.replace(self.active_path, target)
         self._active_first_seq = None
 
+    def _should_fsync(self, now: float) -> bool:
+        if self.fsync_mode == "never":
+            return False
+        if self.fsync_mode == "always":
+            return True
+        return now - self._last_fsync >= self.fsync_interval_s   # "interval"
+
     def append(self, kind: str, data: Any) -> dict:
-        """Append one entry and return it. Raises AuditUnavailable when the entry could not be written."""
+        """Append one entry and return it. Raises AuditUnavailable when the entry could not be written.
+
+        After the write (and outside the lock) retention maintenance is run at most once per
+        maintenance_interval_s, so a long-lived chain is gzipped/pruned without any scheduler. A
+        maintenance failure never propagates into the caller's append."""
         with self._lock:
             try:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -252,16 +274,32 @@ class AuditChain:
                 with open(self.active_path, "a", encoding="utf-8") as handle:
                     handle.write(line)
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    if self._should_fsync(ts):
+                        os.fsync(handle.fileno())
+                        self._last_fsync = ts
                 self._seq, self._hash, self._active_last_ts = seq, digest, ts
                 if self._active_first_seq is None:
                     self._active_first_seq = seq
                 self._write_head()
-                return entry
             except AuditUnavailable:
                 raise
             except (OSError, TypeError, ValueError) as exc:
                 raise AuditUnavailable(f"audit append failed: {exc!r}") from exc
+        self.maybe_maintain()
+        return entry
+
+    def maybe_maintain(self) -> dict:
+        """Run maintenance() at most once per maintenance_interval_s. Never raises: a retention failure is
+        returned as {'error': ...} so it cannot break the audit append it follows. Call it freely."""
+        now = float(self._clock())
+        with self._lock:
+            if now < self._next_maint_ts:
+                return {}
+            self._next_maint_ts = now + self.maintenance_interval_s
+        try:
+            return self.maintenance()
+        except AuditUnavailable as exc:
+            return {"error": repr(exc)}
 
     # ------------------------------------------------------------------ retention
     def maintenance(self) -> dict:

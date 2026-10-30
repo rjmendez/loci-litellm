@@ -267,10 +267,20 @@ async def test_the_ledger_rotates_through_its_env_cap(tmp_path: Path, monkeypatc
     "sk-abcdefghijklmnopqrstuvwx", "ghp_abcdefghijklmnopqrstuvwxyz0123", "AKIAABCDEFGHIJKLMNOP",
     "xoxb-1234567890-abcdefghij", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
     "Bearer abcdefghijklmnopqrstuvwxyz012345",
+    # abliteration.ai key shape (ak_ prefix, underscores inside the random part) — SYNTHETIC value
+    "ak_FAKE0_test1_notarealkey000000000000000",
+    "sk_live_fakefakefakefakefake00", "pk_fakefakefakefakefake00", "rk_fakefakefakefakefake00",
 ])
 def test_known_token_shapes_are_redacted(secret: str) -> None:
     out = redact_secrets(f"use {secret} to call it")
     assert secret.split()[-1] not in out and "REDACTED" in out
+
+
+def test_provider_prefixed_key_is_redacted_but_short_prefix_word_is_not() -> None:
+    # a full-length ak_ key is redacted; an ordinary token that merely starts with "ak_" and is too short stays.
+    out = redact_secrets("key ak_FAKE0_test1_notarealkey000000000000000 and var ak_count here")
+    assert "ak_FAKE0_test1" not in out and "[REDACTED:api-key]" in out
+    assert "ak_count" in out  # 5 chars after ak_, below the length floor: not treated as a secret
 
 
 def test_key_value_secrets_keep_the_key_name() -> None:

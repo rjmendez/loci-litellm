@@ -15,6 +15,9 @@ _PATTERNS = [
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "[REDACTED:github-token]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED:slack-token]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "[REDACTED:api-key]"),
+    # provider keys shaped <prefix>_<random>: abliteration.ai (ak_), Stripe-style (sk_/pk_/rk_).
+    # Underscores are allowed inside the random part (abliteration keys carry them).
+    (re.compile(r"\b(?:ak|sk|pk|rk)_[A-Za-z0-9][A-Za-z0-9_]{14,}\b"), "[REDACTED:api-key]"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b((?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*[\"']?)[^\s\"',;]{6,}"), r"\1[REDACTED]"),
 ]
