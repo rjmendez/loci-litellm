@@ -32,6 +32,7 @@ class _Resolver:
     embed_model = staticmethod(lambda: "m")
     client_rag_trusted = staticmethod(lambda: True)
     grounding_audit_file = staticmethod(lambda: "")
+    memory_write_collection = staticmethod(lambda: "loci_memory")
 
     def embed_api_base(self):
         return self._embed_base
@@ -54,6 +55,7 @@ class _Qdrant:
         self.payload_status = payload_status
         self.searched: list[str] = []
         self.deposits: list[dict] = []
+        self.search_filters: dict[str, dict] = {}   # collection -> the Qdrant filter sent (if any)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -64,6 +66,12 @@ class _Qdrant:
             return httpx.Response(self.payload_status, json={})
         name = path.split("/")[2]
         self.searched.append(name)
+        try:
+            sent = json.loads(request.content)
+            if isinstance(sent, dict) and "filter" in sent:
+                self.search_filters[name] = sent["filter"]
+        except ValueError:
+            pass
         spec = self.per_collection.get(name, [])
         if isinstance(spec, int):
             return httpx.Response(spec, json={"error": "boom"})
@@ -298,7 +306,7 @@ class _Outcome(LociGroundingHook):
         super().__init__(resolver=resolver)
         self.calls = 0
 
-    async def _ground(self, intent: str) -> GroundingOutcome:
+    async def _ground(self, intent: str, tenant: str = "") -> GroundingOutcome:
         self.calls += 1
         return GroundingOutcome(status="miss", reason="no_matching_context")
 
@@ -438,3 +446,50 @@ async def test_a_miss_with_failed_searches_is_not_reported_as_nothing_found(qdra
 
     assert outcome.status == "miss"
     assert outcome.reason == "no_matching_context_some_searches_failed"
+
+
+# ── tenant scoping (LOCI_GROUNDING_TENANT_SCOPE) ───────────────────────────────
+
+def test_tenant_filter_named_sees_own_plus_untagged() -> None:
+    assert gh._tenant_filter("hermes") == {
+        "should": [{"is_empty": {"key": "tenant"}}, {"key": "tenant", "match": {"value": "hermes"}}]
+    }
+
+
+def test_tenant_filter_anonymous_sees_only_untagged() -> None:
+    assert gh._tenant_filter("") == {"must": [{"is_empty": {"key": "tenant"}}]}
+
+
+def test_claimed_client_reads_the_header_lowercased() -> None:
+    data = {"proxy_server_request": {"headers": {"X-Loci-Client": "Hermes"}}}
+    assert gh._claimed_client(data) == "hermes"
+
+
+def test_claimed_client_missing_is_empty() -> None:
+    assert gh._claimed_client({"proxy_server_request": {"headers": {}}}) == ""
+    assert gh._claimed_client({}) == ""
+
+
+@pytest.mark.asyncio
+async def test_tenant_scope_filters_only_the_write_collection(qdrant, monkeypatch) -> None:
+    monkeypatch.setenv("LOCI_GROUNDING_TENANT_SCOPE", "1")
+    fake = qdrant({"mnemosyne": [], "loci_sessions": [], "loci_memory": [_point("a", "alpha beta", numeric_confidence=0.9)]})
+    hook = LociGroundingHook(resolver=_Resolver(deposit_disabled=True))
+
+    await hook._ground("alpha beta lookup", tenant="hermes")
+
+    # only the write collection (loci_memory) carries a tenant filter; curated ones do not
+    assert fake.search_filters.get("loci_memory") == gh._tenant_filter("hermes")
+    assert "mnemosyne" not in fake.search_filters and "loci_sessions" not in fake.search_filters
+
+
+@pytest.mark.asyncio
+async def test_tenant_scope_off_sends_no_filter(qdrant, monkeypatch) -> None:
+    # positive twin: with the flag unset (default), no collection is filtered even if a tenant is passed
+    monkeypatch.delenv("LOCI_GROUNDING_TENANT_SCOPE", raising=False)
+    fake = qdrant({"mnemosyne": [], "loci_sessions": [], "loci_memory": [_point("a", "alpha beta", numeric_confidence=0.9)]})
+    hook = LociGroundingHook(resolver=_Resolver(deposit_disabled=True))
+
+    await hook._ground("alpha beta lookup", tenant="hermes")
+
+    assert fake.search_filters == {}

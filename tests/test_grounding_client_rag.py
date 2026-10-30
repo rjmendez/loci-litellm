@@ -36,7 +36,7 @@ class _RecordingHook(LociGroundingHook):
         super().__init__(resolver=_Resolver(client_trusted, markers))
         self.intents: list[str] = []
 
-    async def _ground(self, intent: str) -> GroundingOutcome:
+    async def _ground(self, intent: str, tenant: str = "") -> GroundingOutcome:
         self.intents.append(intent)
         return GROUNDED
 

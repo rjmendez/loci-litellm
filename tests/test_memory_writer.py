@@ -239,3 +239,87 @@ async def test_reasoning_only_response_is_not_stored_as_an_answer(monkeypatch: p
     )
 
     assert client.calls == []
+
+
+# ── tenant tagging (LOCI_GROUNDING_TENANT_SCOPE) ───────────────────────────────
+
+def _env_for_write(monkeypatch) -> None:
+    monkeypatch.setenv("LOCI_EMBED_API_BASE", "http://embed.local/v1")
+    monkeypatch.setenv("LOCI_QDRANT_URL", "http://qdrant.local")
+    monkeypatch.setenv("LOCI_MEM_MIN_PROMPT_LEN", "20")
+    monkeypatch.delenv("LOCI_MEMORY_WRITER_DISABLED", raising=False)
+
+
+_PROMPT = "Explain the Loci write-back flow and how Qdrant upserts a memory record for this request."
+_RESP = "The writer embeds the question and upserts the result into the loci_memory collection with an id."
+
+
+def _kw(client_header: str | None):
+    kw = {"model": "m", "messages": [{"role": "user", "content": _PROMPT}]}
+    if client_header is not None:
+        kw["litellm_params"] = {"proxy_server_request": {"headers": {"x-loci-client": client_header}}}
+    return kw
+
+
+async def _written_payload(monkeypatch, scope: str | None, client_header: str | None) -> dict:
+    _env_for_write(monkeypatch)
+    if scope is None:
+        monkeypatch.delenv("LOCI_GROUNDING_TENANT_SCOPE", raising=False)
+    else:
+        monkeypatch.setenv("LOCI_GROUNDING_TENANT_SCOPE", scope)
+    client = FakeAsyncClient()
+    writer = LociMemoryWriter(_http_client_factory=lambda: client)
+    await writer.async_log_success_event(_kw(client_header), _response(_RESP), 0.0, 0.0)
+    put = [c for c in client.calls if c["method"] == "PUT"]
+    assert len(put) == 1
+    return put[0]["kwargs"]["json"]["points"][0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_write_tags_tenant_when_scoping_on_and_client_named(monkeypatch) -> None:
+    payload = await _written_payload(monkeypatch, scope="1", client_header="Hermes")
+    assert payload["tenant"] == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_write_omits_tenant_when_anonymous(monkeypatch) -> None:
+    # scoping on but no client header -> no tenant field (is_empty = shared/legacy on retrieval)
+    payload = await _written_payload(monkeypatch, scope="1", client_header=None)
+    assert "tenant" not in payload
+
+
+@pytest.mark.asyncio
+async def test_write_omits_tenant_when_scoping_off(monkeypatch) -> None:
+    # positive twin: flag off -> no tenant field even when the caller named itself
+    payload = await _written_payload(monkeypatch, scope=None, client_header="hermes")
+    assert "tenant" not in payload
+
+
+# ── internal-call opt-out gating (LOCI_INTERNAL_CALL_REQUIRES_CLIENT) ───────────
+
+def _ic_kwargs(marker: bool, client: str | None):
+    lp: dict = {"metadata": {"loci_internal_call": marker}}
+    if client is not None:
+        lp["proxy_server_request"] = {"headers": {"x-loci-client": client}}
+    return {"litellm_params": lp}
+
+
+def test_internal_marker_is_honored_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("LOCI_INTERNAL_CALL_REQUIRES_CLIENT", raising=False)
+    assert LociMemoryWriter._is_internal_call(_ic_kwargs(True, None)) is True
+
+
+def test_internal_marker_ignored_without_client_when_required(monkeypatch) -> None:
+    monkeypatch.setenv("LOCI_INTERNAL_CALL_REQUIRES_CLIENT", "1")
+    assert LociMemoryWriter._is_internal_call(_ic_kwargs(True, None)) is False
+
+
+def test_internal_marker_honored_with_client_when_required(monkeypatch) -> None:
+    # positive twin: the same marker IS honored once the caller identifies itself
+    monkeypatch.setenv("LOCI_INTERNAL_CALL_REQUIRES_CLIENT", "1")
+    assert LociMemoryWriter._is_internal_call(_ic_kwargs(True, "hermes")) is True
+
+
+def test_no_marker_is_never_internal(monkeypatch) -> None:
+    monkeypatch.setenv("LOCI_INTERNAL_CALL_REQUIRES_CLIENT", "1")
+    assert LociMemoryWriter._is_internal_call(_ic_kwargs(False, "hermes")) is False

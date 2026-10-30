@@ -119,6 +119,8 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_CLIENT_RAG_OK_MARKERS` | empty (or `[grounding] client_rag_ok_markers`) | `\|\|`-separated strings; a request containing one is not grounded. Per call. |
 | `LOCI_TRUST_CLIENT_RAG` | `1` | `0` ignores those markers. Per call. |
 | `LOCI_HONOR_INTERNAL_CALL` | `1` | `0` treats `loci_internal_call` requests as ordinary traffic. Per call. |
+| `LOCI_INTERNAL_CALL_REQUIRES_CLIENT` | unset | `1` honors the `loci_internal_call` opt-out only from a caller that named itself with an `x-loci-client` header (claimed, not secret-verified). Enabling it means legitimate internal callers must send that header. Per call. |
+| `LOCI_GROUNDING_TENANT_SCOPE` | unset | `1` tags written records with the caller's claimed `x-loci-client` and filters the write collection on retrieval to that tenant plus untagged (legacy/shared) records. Claimed-identity isolation between the owner's own agent contexts, not a trust boundary. Per call. |
 | `LOCI_GROUNDING_AUDIT_FILE` | unset | Append a metadata-only delivered/lost row per grounded request. Unset: log line only. Per call. |
 | `LOCI_GROUNDING_AUDIT_MAX_BYTES` | `10000000` | At this size the audit file is renamed to `<file>.1` (replacing an older one) and a new one starts. `0` disables rotation. Per call. |
 | `LOCI_MEMORY_WRITER_DISABLED` | unset | `1` stops the memory writer. Per call. |

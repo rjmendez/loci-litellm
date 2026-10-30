@@ -29,7 +29,7 @@ class _HookWithOutcome(LociGroundingHook):
         self._exc = exc
         self.intents: list[str] = []
 
-    async def _ground(self, intent: str) -> GroundingOutcome:
+    async def _ground(self, intent: str, tenant: str = "") -> GroundingOutcome:
         self.intents.append(intent)
         if self._exc is not None:
             raise self._exc
@@ -99,7 +99,7 @@ class _GroundedHook(LociGroundingHook):
     async def _embed(self, text: str) -> list[float]:
         return [0.1]
 
-    async def _search_collection(self, client, col, vector, cf, impf, named, top_k):
+    async def _search_collection(self, client, col, vector, cf, impf, named, top_k, qfilter=None):
         if col != "loci_memory":
             return []
         return [{

@@ -184,14 +184,34 @@ class LociMemoryWriter(CustomLogger):
     @staticmethod
     def _is_internal_call(kwargs: dict[str, Any]) -> bool:
         """True when the client set the metadata.loci_internal_call opt-out (honored unless
-        LOCI_HONOR_INTERNAL_CALL=0). The flag is client-supplied, so any caller can suppress write-back."""
+        LOCI_HONOR_INTERNAL_CALL=0). The flag is client-supplied; with LOCI_INTERNAL_CALL_REQUIRES_CLIENT=1
+        it is honored only from a caller that named itself with an x-loci-client header (claimed, not
+        secret-verified), so a bare caller cannot silently suppress write-back."""
         params: Any = kwargs.get("litellm_params")
         params = params if isinstance(params, dict) else {}
         server_request: Any = params.get("proxy_server_request")
         body: Any = server_request.get("body") if isinstance(server_request, dict) else None
         sources = [kwargs.get("metadata"), params.get("metadata"),
                    body.get("metadata") if isinstance(body, dict) else None]
-        return BackendResolver.is_internal_call(*sources)
+        if not BackendResolver.is_internal_call(*sources):
+            return False
+        if _env_flag("LOCI_INTERNAL_CALL_REQUIRES_CLIENT") and not LociMemoryWriter._claimed_client(kwargs):
+            return False   # marker set but caller unidentified: do not honor; record it like any other call
+        return True
+
+    @staticmethod
+    def _claimed_client(kwargs: dict[str, Any]) -> str:
+        """The caller's claimed `x-loci-client` (lower-cased) from the forwarded request headers, or ''.
+        Used to tag a record's tenant when LOCI_GROUNDING_TENANT_SCOPE is on (claimed, not secret-verified)."""
+        params = kwargs.get("litellm_params")
+        params = params if isinstance(params, dict) else {}
+        server_request = params.get("proxy_server_request")
+        headers = server_request.get("headers") if isinstance(server_request, dict) else None
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if str(k).lower() == "x-loci-client" and isinstance(v, str):
+                    return v.strip().lower()
+        return ""
 
     @staticmethod
     def _point_id_for(prompt: str, response: str, model: str = "") -> str:
@@ -291,6 +311,12 @@ class LociMemoryWriter(CustomLogger):
             # Process-global: the same id for every request.
             "investigation_id": os.environ.get("LOCI_INVESTIGATION_ID", ""),
         }
+        # Tenant tag for scoped retrieval. Only written when scoping is on AND the caller named itself, so
+        # anonymous/legacy records keep no tenant field (is_empty = shared) and the default stays unchanged.
+        if _env_flag("LOCI_GROUNDING_TENANT_SCOPE"):
+            tenant = self._claimed_client(kwargs)
+            if tenant:
+                payload["tenant"] = tenant
         point_id: str = self._point_id_for(prompt, response, str(kwargs.get("model") or ""))
         await self._upsert_point(collection, point_id, vector, payload)
 

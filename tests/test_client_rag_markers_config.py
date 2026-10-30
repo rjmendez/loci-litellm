@@ -51,7 +51,7 @@ class _Hook(LociGroundingHook):
         super().__init__(resolver=BackendResolver)
         self.intents: list[str] = []
 
-    async def _ground(self, intent: str) -> GroundingOutcome:
+    async def _ground(self, intent: str, tenant: str = "") -> GroundingOutcome:
         self.intents.append(intent)
         return GroundingOutcome(status="grounded", context='MEMORY MATCH (1 results from 1 Qdrant collection) for "q":\n[a|0.9] f')
 

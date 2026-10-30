@@ -32,7 +32,7 @@ class _Hook(LociGroundingHook):
         self._outcome = outcome or GroundingOutcome(status="grounded", context=CONTEXT)
         self.intents: list[str] = []
 
-    async def _ground(self, intent: str) -> GroundingOutcome:
+    async def _ground(self, intent: str, tenant: str = "") -> GroundingOutcome:
         self.intents.append(intent)
         return self._outcome
 
