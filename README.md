@@ -230,7 +230,8 @@ rotation), `STOP`, `PAUSE`, `envelope.toml`, `envelope.pin` and `audit/`.
 | Variable | Meaning |
 |---|---|
 | `LOCI_GOVERNOR` | `observe` (default; anything other than `enforce` is observe) or `enforce`. `enforce` takes effect only if the owner envelope is present, pinned and has `[governor] enforce = true`. |
-| `LOCI_GOVERNOR_DIR` | State directory (above). |
+| `LOCI_GOVERNOR_DIR` | State directory (above). Also holds `policy_violations.jsonl` (caller-policy refusals). |
+| `LOCI_POLICY_EXTRA_MODELS` | unset | Comma-separated model names allowed for the verified `hermes` caller in addition to the live router's deployment names (`caller_policy`). Per call. |
 | `LOCI_GOVERNOR_LEDGER` | Cost ledger used to seed the counter (default: the cost ledger's own path). |
 | `LOCI_GOVERNOR_OWNER_KEY_FILE` | File with the owner's HMAC key; a matching signed `envelope_pin` entry in the audit chain accepts an envelope whose hash differs from the pin file. |
 
