@@ -191,3 +191,66 @@ def test_recall_patterns_can_be_overridden(stub_identity_and_router, monkeypatch
     data = _recall_data("tell me about the zebra incident")
     _run(data)
     assert data["tool_choice"]["function"]["name"] == "mcp__loci__rag_context_search"
+
+
+# --- act, don't talk: a promised tool action must become a tool call on the next turn ---
+
+def _promise_data(assistant_text: str, tools=None, tool_choice=None, tool_calls=None) -> dict:
+    assistant = {"role": "assistant", "content": assistant_text}
+    if tool_calls is not None:
+        assistant["tool_calls"] = tool_calls
+    d = {"model": GOOD_MODEL, "messages": [{"role": "user", "content": "check the store"}, assistant]}
+    d["tools"] = [RETRIEVAL] if tools is None else tools
+    if tool_choice is not None:
+        d["tool_choice"] = tool_choice
+    return d
+
+
+def test_promised_action_without_a_call_requires_a_tool(stub_identity_and_router) -> None:
+    data = _promise_data("I'll check the investigation store and report back.")
+    _run(data)
+    assert data["tool_choice"] == "required"
+    assert data["messages"][-1]["role"] == "system"
+    assert "made no tool call" in data["messages"][-1]["content"]
+
+
+def test_promise_is_recorded_as_a_violation(stub_identity_and_router) -> None:
+    _run(_promise_data("Let me run the query now."))
+    rows = [json.loads(line) for line in (stub_identity_and_router / cp.VIOLATIONS_FILE).read_text(
+        encoding="utf-8").splitlines()]
+    assert [r["reason"] for r in rows] == ["unfulfilled_promise"]
+
+
+def test_promise_that_already_made_a_call_is_not_forced(stub_identity_and_router) -> None:
+    # positive twin: the assistant turn carries a real tool call, so nothing was promised and not made
+    calls = [{"id": "c1", "type": "function", "function": {"name": "mcp__loci__rag_context_search",
+                                                           "arguments": "{\"query\": \"x\"}"}}]
+    data = _promise_data("I'll check the store.", tool_calls=calls)
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_plain_reply_without_a_promise_is_not_forced(stub_identity_and_router) -> None:
+    data = _promise_data("The relay is on port 4443.")
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_no_tools_offered_means_no_forcing(stub_identity_and_router) -> None:
+    data = _promise_data("I'll check the store.", tools=[])
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_callers_tool_choice_none_is_respected(stub_identity_and_router) -> None:
+    data = _promise_data("I'll check the store.", tool_choice="none")
+    _run(data)
+    assert data["tool_choice"] == "none"
+
+
+def test_unidentified_caller_is_also_held_to_the_promise_rule(stub_identity_and_router) -> None:
+    # the rule is not identity-gated: no headers at all still gets the required tool call
+    data = _promise_data("Let me verify that against the logs.")
+    data["proxy_server_request"] = {"headers": {}}
+    _run(data)
+    assert data["tool_choice"] == "required"

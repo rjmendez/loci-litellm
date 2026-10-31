@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -182,15 +183,73 @@ def _force_retrieval(data: dict) -> Optional[str]:
     return name
 
 
+# "Act, don't talk": the last assistant turn promised an action ("I'll check...", "let me run...") and sent no tool
+# call, while tools are on offer. The next turn must be a tool call. Applies to every caller with tools (not only
+# the verified identity), because the identity header is not yet reaching Hermes. Clears once a tool has run.
+_PROMISE_RE = re.compile(
+    r"\b(i'?ll|i will|let me|i'?m going to|i am going to|next,? i'?ll|proceeding to)\b[^.\n]{0,80}?"
+    r"\b(pull|check|run|search|query|call|open|fetch|look|retrieve|verify|test|start|deploy|read|inspect|grep|"
+    r"patch|fix|write|create|store|send|list|get|validate|confirm)\w*",
+    re.IGNORECASE,
+)
+
+
+def _unfulfilled_promise(messages: Any) -> Optional[str]:
+    """The promised-action text when the newest assistant turn promised a tool action without making one."""
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role in ("tool", "user"):
+            return None
+        if role == "assistant":
+            if message.get("tool_calls"):
+                return None
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+            text = str(content or "")
+            m = _PROMISE_RE.search(text)
+            return m.group(0) if m else None
+    return None
+
+
+def _enforce_action(data: dict) -> Optional[str]:
+    """Require a tool call when the last assistant turn promised one. Returns the promise text, or None."""
+    if not data.get("tools") or data.get("tool_choice") not in (None, "auto"):
+        return None
+    promise = _unfulfilled_promise(data.get("messages"))
+    if promise is None:
+        return None
+    data["tool_choice"] = "required"
+    data["messages"] = list(data["messages"]) + [{
+        "role": "system",
+        "content": "Your previous message said you would act (" + promise[:120] + ") but you made no tool call. "
+                   "Make the tool call now. Do not describe the action again.",
+    }]
+    return promise
+
+
 class LociCallerPolicy(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> Any:
         if not isinstance(data, dict):
             return None
+        promise = _enforce_action(data)
+        if promise is not None:
+            _record("unfulfilled_promise", "any", promise)
+            logger.info("caller policy: unfulfilled promise, tool call required: %r", promise[:80])
         try:
             from loci_litellm.governor import loci_governor  # the governor owns the envelope (trust source)
 
             env = loci_governor.governor._envelope()
-            who = identify(_headers(data), env.clients, env.caps.anonymous_day)
+            headers = _headers(data)
+            who = identify(headers, env.clients, env.caps.anonymous_day)
+            claimed = str(headers.get("x-loci-client") or "")
+            if claimed.lower() in ENFORCED_CLIENTS and not (who.known and who.name in ENFORCED_CLIENTS):
+                # a claimed hermes call that did not verify is not enforced: say so, never pass silently
+                logger.warning("caller policy: claimed client %r did NOT verify; policy not applied", claimed)
             if not (who.known and who.name in ENFORCED_CLIENTS):
                 return None
             self._enforce(data, who.name)
@@ -220,6 +279,10 @@ class LociCallerPolicy(CustomLogger):
         forced = _force_retrieval(data)
         if forced:
             logger.info("caller policy: recall question forced to tool %s", forced)
+        else:
+            logger.info("caller policy: no forcing (tool_choice=%r, tools=%d, tool_activity=%s)",
+                        data.get("tool_choice"), len(data.get("tools") or []),
+                        _turn_has_tool_activity(data.get("messages")))
 
 
 loci_caller_policy = LociCallerPolicy()
