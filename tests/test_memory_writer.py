@@ -323,3 +323,11 @@ def test_internal_marker_honored_with_client_when_required(monkeypatch) -> None:
 def test_no_marker_is_never_internal(monkeypatch) -> None:
     monkeypatch.setenv("LOCI_INTERNAL_CALL_REQUIRES_CLIENT", "1")
     assert LociMemoryWriter._is_internal_call(_ic_kwargs(False, "hermes")) is False
+
+
+def test_bare_json_answer_is_not_stored(monkeypatch) -> None:
+    # a title object returned as the "answer" is not a fact and must not be written back as memory
+    from loci_litellm import memory_writer as mw
+    assert mw._is_bare_json('{"title": "Check Loci Memory"}') is True
+    assert mw._is_bare_json("The relay listens on port 4443.") is False
+    assert mw._is_bare_json("[1, 2") is False

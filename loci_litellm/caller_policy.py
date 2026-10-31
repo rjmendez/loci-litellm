@@ -156,13 +156,20 @@ def _turn_has_tool_activity(messages: Any) -> bool:
     return False
 
 
+# Hermes sends the Loci tools deferred: only tool_search / tool_describe / tool_call are in the request. When the
+# retrieval tool itself is absent, the forced call is tool_search, and the model then reaches Loci through it.
+_DISCOVERY_TOOL = "tool_search"
+
+
 def _retrieval_tool_name(tools: Any) -> Optional[str]:
+    names = []
     for tool in tools or []:
         fn = tool.get("function") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
-        name = str(fn.get("name") or "")
+        names.append(str(fn.get("name") or ""))
+    for name in names:
         if name.endswith(_RETRIEVAL_TOOL_SUFFIX):
             return name
-    return None
+    return _DISCOVERY_TOOL if _DISCOVERY_TOOL in names else None
 
 
 def _force_retrieval(data: dict) -> Optional[str]:

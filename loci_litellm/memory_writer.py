@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 import os
 import time
 from typing import Any, Callable, Optional
@@ -41,6 +42,13 @@ def _env_number(name: str, default: Any, cast: Callable[[str], Any] = float) -> 
 
 # Cap on distinct failure reasons tracked, so odd error text cannot grow the dict.
 _MAX_FAILURE_KEYS = 64
+
+
+def _is_bare_json(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), (dict, list))
+    except ValueError:
+        return False
 
 
 class LociMemoryWriter(CustomLogger):
@@ -285,6 +293,10 @@ class LociMemoryWriter(CustomLogger):
             return
         if not _env_flag("LOCI_MEM_REDACT_DISABLED"):
             prompt, response = redact_secrets(prompt), redact_secrets(response)
+        # A bare JSON value (a title object, a tool-argument blob) is not an answer. Stored, it comes back as
+        # "prior finding" and the model treats its own guess as fact (2026-10-31 self-echo loop).
+        if response.lstrip()[:1] in ("{", "[") and _is_bare_json(response):
+            return
 
         # The vector embeds the prompt only; recall queries are also prompts.
         vector: Optional[list[float]] = await self._embed_text(prompt)

@@ -254,3 +254,12 @@ def test_unidentified_caller_is_also_held_to_the_promise_rule(stub_identity_and_
     data["proxy_server_request"] = {"headers": {}}
     _run(data)
     assert data["tool_choice"] == "required"
+
+
+def test_deferred_loci_tools_force_the_discovery_tool(stub_identity_and_router) -> None:
+    # Hermes sends the Loci tools deferred: no rag tool in the request, only tool_search. The recall question
+    # must still reach a tool first, through tool_search.
+    discovery = {"type": "function", "function": {"name": "tool_search", "parameters": {}}}
+    data = _recall_data("What did we decide about the relay earlier?", tools=[discovery])
+    _run(data)
+    assert data["tool_choice"] == {"type": "function", "function": {"name": "tool_search"}}
