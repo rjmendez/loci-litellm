@@ -132,3 +132,62 @@ def test_extra_models_from_env_are_allowed(stub_identity_and_router, monkeypatch
     assert _run(_data("abliterated-model-large-v2", headers=_hermes_headers())) is None
     with pytest.raises(cp.PolicyRejection, match="not served"):
         _run(_data("abliterated-model-xl", headers=_hermes_headers()))
+
+
+# --- forced retrieval: a recall question must reach the memory tool before the model answers ---
+
+RETRIEVAL = {"type": "function", "function": {"name": "mcp__loci__rag_context_search", "parameters": {}}}
+
+
+def _recall_data(text: str, tools=None, extra_messages=(), tool_choice=None) -> dict:
+    d = _data(GOOD_MODEL, messages=[{"role": "user", "content": text}, *extra_messages],
+              headers=_hermes_headers())
+    d["tools"] = [RETRIEVAL] if tools is None else tools
+    if tool_choice is not None:
+        d["tool_choice"] = tool_choice
+    return d
+
+
+def test_recall_question_is_forced_to_the_memory_tool(stub_identity_and_router) -> None:
+    data = _recall_data("What did we decide about the relay earlier?")
+    _run(data)
+    assert data["tool_choice"] == {"type": "function", "function": {"name": "mcp__loci__rag_context_search"}}
+
+
+def test_non_recall_question_is_not_forced(stub_identity_and_router) -> None:
+    # positive twin: an ordinary request is left alone
+    data = _recall_data("Reformat this list into a table.")
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_no_forcing_once_the_turn_already_used_a_tool(stub_identity_and_router) -> None:
+    # the model has gone to a tool this turn; forcing again would loop
+    extra = [{"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "mcp__loci__rag_context_search", "arguments": "{}"}}]},
+             {"role": "tool", "tool_call_id": "c1", "content": "results"}]
+    data = _recall_data("What did we decide about the relay earlier?", extra_messages=extra)
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_callers_own_tool_choice_is_respected(stub_identity_and_router) -> None:
+    data = _recall_data("What did we decide earlier?", tool_choice="none")
+    _run(data)
+    assert data["tool_choice"] == "none"
+
+
+def test_no_retrieval_tool_offered_means_no_forcing(stub_identity_and_router) -> None:
+    data = _recall_data("What did we decide earlier?", tools=[])
+    _run(data)
+    assert "tool_choice" not in data
+
+
+def test_recall_patterns_can_be_overridden(stub_identity_and_router, monkeypatch) -> None:
+    monkeypatch.setenv("LOCI_POLICY_RECALL_PATTERNS", "zebra")
+    data = _recall_data("What did we decide earlier?")
+    _run(data)
+    assert "tool_choice" not in data
+    data = _recall_data("tell me about the zebra incident")
+    _run(data)
+    assert data["tool_choice"]["function"]["name"] == "mcp__loci__rag_context_search"

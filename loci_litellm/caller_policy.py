@@ -113,6 +113,75 @@ def _tool_call_args_bad(messages: Any) -> Optional[str]:
     return None
 
 
+# A question about stored memory or earlier work must go to the memory tool before the model answers it.
+# Patterns are matched against the newest user turn; override with LOCI_POLICY_RECALL_PATTERNS ("||" separated).
+_DEFAULT_RECALL_PATTERNS = (
+    "remember", "recall", "earlier", "previous", "last time", "we decided", "we did", "investigation",
+    "finding", "loci", "memory", "stored", "what do we know", "what did we",
+)
+_RETRIEVAL_TOOL_SUFFIX = "rag_context_search"   # the Loci tool that searches stored memory (matched by name)
+
+
+def _recall_patterns() -> tuple:
+    raw = os.environ.get("LOCI_POLICY_RECALL_PATTERNS")
+    if raw is None:
+        return _DEFAULT_RECALL_PATTERNS
+    return tuple(p.strip().lower() for p in raw.split("||") if p.strip())
+
+
+def _latest_user_text(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+            return str(content or "")
+    return ""
+
+
+def _turn_has_tool_activity(messages: Any) -> bool:
+    """True once this user turn already contains a tool call or tool result (the model has gone to a tool)."""
+    if not isinstance(messages, list):
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            return False
+        if message.get("role") == "tool" or message.get("tool_calls"):
+            return True
+    return False
+
+
+def _retrieval_tool_name(tools: Any) -> Optional[str]:
+    for tool in tools or []:
+        fn = tool.get("function") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
+        name = str(fn.get("name") or "")
+        if name.endswith(_RETRIEVAL_TOOL_SUFFIX):
+            return name
+    return None
+
+
+def _force_retrieval(data: dict) -> Optional[str]:
+    """Set tool_choice to the memory tool when a recall question has not been sent to a tool yet. Returns the
+    forced tool name, or None. Never overrides a caller's own explicit tool_choice."""
+    tool_choice = data.get("tool_choice")
+    if tool_choice not in (None, "auto"):
+        return None
+    text = _latest_user_text(data.get("messages")).lower()
+    if not any(p in text for p in _recall_patterns()):
+        return None
+    if _turn_has_tool_activity(data.get("messages")):
+        return None
+    name = _retrieval_tool_name(data.get("tools"))
+    if name is None:
+        return None
+    data["tool_choice"] = {"type": "function", "function": {"name": name}}
+    return name
+
+
 class LociCallerPolicy(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> Any:
         if not isinstance(data, dict):
@@ -148,6 +217,9 @@ class LociCallerPolicy(CustomLogger):
             _record("malformed_tool_call_history", client, bad)
             raise PolicyRejection(400, "malformed_tool_call_history",
                                   f"a prior tool call has invalid arguments ({bad}); fix and resend")
+        forced = _force_retrieval(data)
+        if forced:
+            logger.info("caller policy: recall question forced to tool %s", forced)
 
 
 loci_caller_policy = LociCallerPolicy()
